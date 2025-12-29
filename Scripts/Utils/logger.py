@@ -1,43 +1,42 @@
 # utils/logger.py
-import os
 import time
 import traceback
 from datetime import datetime
 
-
 class Logger:
-    def __init__(self, logs_dir, console=False):
-        self.logs_dir = logs_dir
+    def __init__(self, console=False):
         self.console = console
         self.start_time = time.time()
+        self.messages = []
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_file = os.path.join(logs_dir, f"pdf_processing_{timestamp}.log")
-
-    def _write(self, level, message):
+    def _format(self, level, message):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{timestamp}] [{level}] {message}"
-
-        with open(self.log_file, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-
+        self.messages.append(line)
         if self.console:
             print(line)
+        return line
 
     def info(self, message):
-        self._write("INFO", message)
+        return self._format("INFO", message)
 
     def warning(self, message):
-        self._write("WARNING", message)
+        return self._format("WARNING", message)
 
     def error(self, message, exc=None):
-        self._write("ERROR", message)
+        line = self._format("ERROR", message)
         if exc:
-            with open(self.log_file, "a", encoding="utf-8") as f:
-                f.write(traceback.format_exc() + "\n")
+            tb = traceback.format_exc()
+            self.messages.append(tb)
+            if self.console:
+                print(tb)
+        return line
 
     def success(self, message):
-        self._write("SUCCESS", message)
+        return self._format("SUCCESS", message)
 
     def elapsed(self):
         return f"{time.time() - self.start_time:.2f} сек"
+
+    def get_logs(self):
+        return "\n".join(self.messages)
