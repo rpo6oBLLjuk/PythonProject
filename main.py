@@ -2,7 +2,6 @@ import os
 
 from Scripts.PDFProcessor.pdf_converter import convert_pdf_to_text
 from Scripts.Utils.logger import Logger
-from Scripts.Utils.results import save_results
 
 
 # ================================
@@ -35,11 +34,11 @@ def main():
             max_pages=max_pages,
         )
 
-        results = save_results(text_per_page, results_dir)
+        #results = save_results(text_per_page, results_dir)
 
         print("\nРезультаты обработки:")
-        for name, path in results.items():
-            print(f"{name}: {path}")
+        #for name, path in results.items():
+        #    print(f"{name}: {path}")
 
         logger.success("Обработка завершена успешно")
 

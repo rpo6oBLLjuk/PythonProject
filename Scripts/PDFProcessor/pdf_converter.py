@@ -6,16 +6,42 @@ from pdfminer.layout import LTTextContainer, LTChar, LTRect, LTFigure
 from PIL import Image
 from pdf2image import convert_from_path
 import pytesseract
+import json
+from dataclasses import dataclass, asdict
+from typing import List, Tuple, Optional, Dict, Any
+import re
 
 from Scripts.Utils.logger import Logger
 from PySide6.QtCore import QThread, Signal
 
-POPPLER_PATH = r'C:\Users\Admin\Documents\Github\PythonProject\Packages\poppler-25.12.0\Library\bin'
+POPPLER_PATH = r'Packages\poppler-25.12.0\Library\bin'
 
-class PDFConverterThread(QThread):
-    progress = Signal(str)        # Логи и статус по ходу
-    page_ready = Signal(int, list)  # Страница готова
-    finished_conversion = Signal(dict)  # Все результаты
+
+@dataclass
+class TextElementData:
+    """Упрощенная структура для передачи через сигналы"""
+    text: str
+    element_type: str
+    font_name: Optional[str] = None
+    font_size: Optional[float] = None
+    is_bold: bool = False
+    is_italic: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "text": self.text,
+            "type": self.element_type,
+            "font_name": self.font_name,
+            "font_size": self.font_size,
+            "is_bold": self.is_bold,
+            "is_italic": self.is_italic
+        }
+
+
+class PDFConverterWithStructureThread(QThread):
+    progress = Signal(str)  # Статус
+    page_ready = Signal(int, str)  # Номер страницы и JSON данные
+    finished_conversion = Signal(str)  # Все результаты в JSON
 
     def __init__(self, pdf_path, temp_dir, max_pages):
         super().__init__()
@@ -25,31 +51,91 @@ class PDFConverterThread(QThread):
         self.logger = Logger(console=False)
 
     def run(self):
-        self.logger.info("Запуск конвертации в отдельном потоке")
+        self.logger.info("Запуск конвертации с сохранением структуры")
         try:
-            result = convert_pdf_to_text(self.pdf_path, self.temp_dir, self.logger, self.max_pages, self.progress, self.page_ready)
-            self.finished_conversion.emit(result)
+            result = convert_pdf_to_text_with_structure(
+                self.pdf_path, self.temp_dir, self.logger,
+                self.max_pages, self.progress, self.page_ready
+            )
+            # Сериализуем результат в JSON
+            result_json = json.dumps(result, ensure_ascii=False)
+            self.progress.emit("Конвертация завершена")
+            self.finished_conversion.emit(result_json)
         except Exception as e:
             self.logger.error("Ошибка в потоке", e)
-            self.finished_conversion.emit({})
+            self.progress.emit(f"Ошибка: {str(e)}")
+            self.finished_conversion.emit("{}")
 
-def text_extraction(element, logger):
+
+def text_extraction_with_styles(element, logger):
+    """Извлечение текста со стилями"""
     try:
-        text = element.get_text()
-        formats = []
-        for line in element:
-            if isinstance(line, LTTextContainer):
-                for char in line:
+        text = element.get_text().strip()
+        if not text:
+            return []
+
+        elements_data = []
+
+        for text_line in element:
+            if isinstance(text_line, LTTextContainer):
+                line_text = ""
+                current_font = None
+                current_size = None
+                is_bold = False
+                is_italic = False
+
+                for char in text_line:
                     if isinstance(char, LTChar):
-                        formats.append((char.fontname, char.size))
-        return text, list(set(formats))
+                        if line_text and (char.fontname != current_font or char.size != current_size):
+                            if line_text.strip():
+                                # Определяем стили
+                                if current_font:
+                                    is_bold = "bold" in current_font.lower() or "black" in current_font.lower()
+                                    is_italic = "italic" in current_font.lower() or "oblique" in current_font.lower()
+
+                                elem = TextElementData(
+                                    text=line_text,
+                                    element_type="regular",
+                                    font_name=current_font,
+                                    font_size=current_size,
+                                    is_bold=is_bold,
+                                    is_italic=is_italic
+                                )
+                                elements_data.append(elem)
+
+                            line_text = char.get_text()
+                            current_font = char.fontname
+                            current_size = char.size
+                        else:
+                            line_text += char.get_text()
+                            if not current_font:
+                                current_font = char.fontname
+                                current_size = char.size
+
+                if line_text.strip():
+                    if current_font:
+                        is_bold = "bold" in current_font.lower() or "black" in current_font.lower()
+                        is_italic = "italic" in current_font.lower() or "oblique" in current_font.lower()
+
+                    elem = TextElementData(
+                        text=line_text,
+                        element_type="regular",
+                        font_name=current_font,
+                        font_size=current_size,
+                        is_bold=is_bold,
+                        is_italic=is_italic
+                    )
+                    elements_data.append(elem)
+
+        return elements_data
     except Exception as e:
-        logger.error("Ошибка извлечения текста", e)
-        return "", []
+        logger.error("Ошибка извлечения текста со стилями", e)
+        return []
+
 
 def crop_image(element, pageObj, temp_dir, logger):
     try:
-        path = os.path.join(temp_dir, "crop.pdf")
+        path = os.path.join(temp_dir, f"crop_{hash(element)}.pdf")
         pageObj.mediabox.lower_left = (element.x0, element.y0)
         pageObj.mediabox.upper_right = (element.x1, element.y1)
 
@@ -62,16 +148,18 @@ def crop_image(element, pageObj, temp_dir, logger):
         logger.error("Ошибка обрезки изображения", e)
         return None
 
+
 def pdf_to_image(pdf_path, temp_dir, logger):
     try:
         images = convert_from_path(pdf_path, poppler_path=POPPLER_PATH)
         if images:
-            img_path = os.path.join(temp_dir, "image.png")
+            img_path = os.path.join(temp_dir, f"image_{hash(pdf_path)}.png")
             images[0].save(img_path)
             return img_path
     except Exception as e:
         logger.error("Ошибка конвертации PDF в изображение", e)
     return None
+
 
 def image_to_text(image_path, logger):
     try:
@@ -84,6 +172,7 @@ def image_to_text(image_path, logger):
         logger.error("Ошибка OCR", e)
         return ""
 
+
 def extract_table(pdf_path, page_num, table_num, logger):
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -94,70 +183,186 @@ def extract_table(pdf_path, page_num, table_num, logger):
         logger.error("Ошибка извлечения таблицы", e)
     return None
 
+
 def table_to_string(table):
+    if not table:
+        return ""
     return "\n".join(
-        "|" + "|".join(cell or "" for cell in row) + "|" for row in table
+        "|" + "|".join(str(cell or "") for cell in row) + "|" for row in table
     )
 
-def convert_pdf_to_text(pdf_path, temp_dir, logger, max_pages=None, progress_signal=None, page_signal=None):
-    text_per_page = {}
 
-    reader = PyPDF2.PdfReader(open(pdf_path, "rb"))
-    pages = list(extract_pages(pdf_path))
-    pages = pages[:max_pages] if max_pages else pages
+def classify_and_group_text(elements: List[TextElementData], logger):
+    """Классификация и группировка текста"""
+    if not elements:
+        return []
 
-    for idx, page in enumerate(pages):
-        logger.info(f"Обработка страницы {idx + 1}")
-        if progress_signal:
-            progress_signal.emit(f"Обработка страницы {idx + 1}")
+    # Анализ размеров шрифтов
+    font_sizes = [e.font_size for e in elements if e.font_size]
+    if font_sizes:
+        avg_size = sum(font_sizes) / len(font_sizes)
+    else:
+        avg_size = 12
 
-        pageObj = reader.pages[idx]
-        page_text, formats = [], []
-        images_text, tables_text = [], []
-        page_content = []
+    # Классификация
+    for element in elements:
+        elem_type = "regular"
 
-        elements = sorted(
-            [(el.y1, el) for el in page if hasattr(el, "y1")],
-            key=lambda x: x[0], reverse=True
+        # Заголовки по размеру шрифта
+        if element.font_size and element.font_size > avg_size * 1.3:
+            elem_type = "header"
+        elif element.font_size and element.font_size > avg_size * 1.1:
+            elem_type = "subheader"
+
+        # Номера задач и варианты ответов
+        elif re.match(r'^\d+[\.\)]\s*', element.text.strip()):
+            elem_type = "task_number"
+        elif re.match(r'^[A-Da-d][\.\)]\s*', element.text.strip()):
+            elem_type = "answer_option"
+
+        # Жирный текст
+        elif element.is_bold and element.font_size and element.font_size >= avg_size:
+            elem_type = "bold_text"
+
+        element.element_type = elem_type
+
+    # Группировка по абзацам
+    return group_text_elements(elements, logger)
+
+
+def group_text_elements(elements: List[TextElementData], logger):
+    """Группировка элементов в абзацы"""
+    if not elements:
+        return []
+
+    grouped = []
+    current_group = []
+    current_font = None
+    current_size = None
+
+    for element in elements:
+        # Элементы, которые не группируются
+        if element.element_type in ["header", "subheader", "task_number", "answer_option", "table", "image_text"]:
+            # Сохраняем предыдущую группу
+            if current_group:
+                paragraph_text = "".join([e.text for e in current_group])
+                paragraph_elem = TextElementData(
+                    text=paragraph_text,
+                    element_type="paragraph",
+                    font_name=current_font,
+                    font_size=current_size
+                )
+                grouped.append(paragraph_elem)
+                current_group = []
+
+            grouped.append(element)
+            current_font = None
+            current_size = None
+
+        else:
+            if not current_group:
+                current_font = element.font_name
+                current_size = element.font_size
+            current_group.append(element)
+
+    # Обработка последней группы
+    if current_group:
+        paragraph_text = "".join([e.text for e in current_group])
+        paragraph_elem = TextElementData(
+            text=paragraph_text,
+            element_type="paragraph",
+            font_name=current_font,
+            font_size=current_size
         )
+        grouped.append(paragraph_elem)
+
+    return grouped
+
+
+def convert_pdf_to_text_with_structure(pdf_path, temp_dir, logger, max_pages=None, progress_signal=None,
+                                       page_signal=None):
+    """Конвертация PDF в текст с сохранением структуры"""
+    all_pages_data = {}
+
+    # Открываем PDF для чтения
+    reader = PyPDF2.PdfReader(open(pdf_path, "rb"))
+
+    # Получаем страницы через pdfminer
+    pages = list(extract_pages(pdf_path))
+    if max_pages:
+        pages = pages[:max_pages]
+
+    total_pages = len(pages)
+
+    for page_idx, page_layout in enumerate(pages):
+        page_num = page_idx + 1
+
+        if progress_signal:
+            progress_signal.emit(f"Обработка страницы {page_num}/{total_pages}")
+
+        pageObj = reader.pages[page_idx]
+        page_elements = []
+
+        # Сортируем элементы по вертикальной позиции (сверху вниз)
+        elements = []
+        for element in page_layout:
+            if hasattr(element, 'y1'):
+                elements.append((element.y1, element))
+
+        elements.sort(key=lambda x: x[0], reverse=True)  # Сверху вниз
 
         table_idx = 0
 
-        for _, el in elements:
-            if isinstance(el, LTTextContainer):
-                text, fmt = text_extraction(el, logger)
-                if text.strip():
-                    page_text.append(text)
-                    formats.append(fmt)
-                    page_content.append(text)
+        for _, element in elements:
+            if isinstance(element, LTTextContainer):
+                # Извлекаем текст со стилями
+                text_elements = text_extraction_with_styles(element, logger)
+                if text_elements:
+                    page_elements.extend(text_elements)
 
-            elif isinstance(el, LTFigure):
-                cropped = crop_image(el, pageObj, temp_dir, logger)
-                if cropped:
-                    img = pdf_to_image(cropped, temp_dir, logger)
-                    if img:
-                        text = image_to_text(img, logger)
+            elif isinstance(element, LTFigure):
+                # Обработка изображений
+                cropped_pdf = crop_image(element, pageObj, temp_dir, logger)
+                if cropped_pdf:
+                    image_path = pdf_to_image(cropped_pdf, temp_dir, logger)
+                    if image_path:
+                        text = image_to_text(image_path, logger)
                         if text.strip():
-                            images_text.append(text)
-                            page_content.append(text)
+                            img_element = TextElementData(
+                                text=text.strip(),
+                                element_type="image_text"
+                            )
+                            page_elements.append(img_element)
 
-            elif isinstance(el, LTRect):
-                table = extract_table(pdf_path, idx, table_idx, logger)
+            elif isinstance(element, LTRect):
+                # Обработка таблиц
+                table = extract_table(pdf_path, page_idx, table_idx, logger)
                 if table:
                     table_text = table_to_string(table)
-                    tables_text.append(table_text)
-                    page_content.append(table_text)
+                    table_element = TextElementData(
+                        text=table_text,
+                        element_type="table"
+                    )
+                    page_elements.append(table_element)
                     table_idx += 1
 
-        text_per_page[f"Page_{idx}"] = [
-            page_text,
-            formats,
-            images_text,
-            tables_text,
-            page_content,
-        ]
+        # Классифицируем и группируем элементы
+        if page_elements:
+            classified_elements = classify_and_group_text(page_elements, logger)
+        else:
+            classified_elements = []
 
+        # Формируем данные страницы
+        page_data = {
+            "page_number": page_num,
+            "elements": [elem.to_dict() for elem in classified_elements]
+        }
+
+        all_pages_data[f"page_{page_num}"] = page_data
+
+        # Отправляем данные страницы
         if page_signal:
-            page_signal.emit(idx + 1, page_content)
+            page_json = json.dumps(page_data, ensure_ascii=False)
+            page_signal.emit(page_num, page_json)
 
-    return text_per_page
+    return all_pages_data
