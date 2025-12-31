@@ -9,6 +9,8 @@ from PySide6.QtCore import Qt, QTimer, QDateTime
 
 from Scripts.PDFProcessor.pdf_converter import PDFConverterWithStructureThread
 
+from PyPDF2 import PdfReader
+
 import os
 import json
 import sys
@@ -43,10 +45,13 @@ class PDFConverterUI(QWidget):
 
     def setup_ui(self):
         main_layout = QVBoxLayout()
+        main_layout.setSpacing(10)  # опционально, чтобы выглядело аккуратнее
+        main_layout.setContentsMargins(10, 10, 10, 10)
 
         # Верхняя панель: выбор файла и настройки
         top_group = QGroupBox("Параметры конвертации")
         top_layout = QVBoxLayout()
+        top_layout.setSpacing(8)
 
         # Выбор файла
         file_layout = QHBoxLayout()
@@ -54,12 +59,15 @@ class PDFConverterUI(QWidget):
         self.pdf_input.setPlaceholderText("Выберите PDF файл...")
         browse_btn = QPushButton("Обзор")
         browse_btn.clicked.connect(self.browse_pdf)
+
         file_layout.addWidget(self.pdf_input)
         file_layout.addWidget(browse_btn)
         top_layout.addLayout(file_layout)
 
         # Настройки
         settings_layout = QHBoxLayout()
+        settings_layout.setSpacing(8)
+
         settings_layout.addWidget(QLabel("Макс. страниц:"))
         self.pages_spin = QSpinBox()
         self.pages_spin.setMinimum(1)
@@ -72,23 +80,20 @@ class PDFConverterUI(QWidget):
         self.format_combo.addItems(["Текст с разметкой", "Сырой текст", "JSON"])
         settings_layout.addWidget(self.format_combo)
 
-        # Переключатель однотонного режима
         self.monochrome_checkbox = QCheckBox("Однотонный вывод")
         self.monochrome_checkbox.toggled.connect(self.toggle_monochrome_mode)
         settings_layout.addWidget(self.monochrome_checkbox)
 
         settings_layout.addStretch()
-        top_layout.addLayout(settings_layout)
-        top_group.setLayout(top_layout)
-        main_layout.addWidget(top_group)
 
-        # Кнопка сохранения
+        # Кнопка сохранения (ВАЖНО: добавляем ДО добавления settings_layout в top_layout)
         self.save_btn = QPushButton("💾 Сохранить результаты")
         self.save_btn.clicked.connect(self.save_results)
         self.save_btn.setEnabled(False)
         settings_layout.addWidget(self.save_btn)
 
         top_layout.addLayout(settings_layout)
+
         top_group.setLayout(top_layout)
         main_layout.addWidget(top_group)
 
@@ -96,20 +101,16 @@ class PDFConverterUI(QWidget):
         self.run_btn = QPushButton("🔍 Начать конвертацию и анализ")
         self.run_btn.clicked.connect(self.run_conversion)
         self.run_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db;
-                color: white;
-                font-weight: bold;
-                padding: 8px;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #2980b9;
-            }
-            QPushButton:disabled {
-                background-color: #bdc3c7;
-            }
-        """)
+                QPushButton {
+                    background-color: #3498db;
+                    color: white;
+                    font-weight: bold;
+                    padding: 8px;
+                    border-radius: 4px;
+                }
+                QPushButton:hover { background-color: #2980b9; }
+                QPushButton:disabled { background-color: #bdc3c7; }
+            """)
         main_layout.addWidget(self.run_btn)
 
         # Основная область с разделителем
@@ -212,11 +213,15 @@ class PDFConverterUI(QWidget):
             self.pdf_path = file_dialog.selectedFiles()[0]
             self.pdf_input.setText(self.pdf_path)
             try:
-                from pdfminer.high_level import extract_pages
-                pages = list(extract_pages(self.pdf_path))
-                self.pages_spin.setMaximum(len(pages))
-                self.pages_spin.setValue(min(len(pages), 10))
-                self.status_label.setText(f"Файл загружен: {os.path.basename(self.pdf_path)} ({len(pages)} стр.)")
+                reader = PdfReader(self.pdf_path)
+                page_count = len(reader.pages)
+
+                self.pages_spin.setMaximum(page_count)
+                self.pages_spin.setValue(page_count)
+
+                self.status_label.setText(
+                    f"Файл загружен: {os.path.basename(self.pdf_path)} ({page_count} стр.)"
+                )
             except Exception as e:
                 self.status_label.setText(f"Ошибка чтения PDF: {str(e)}")
 
@@ -231,6 +236,7 @@ class PDFConverterUI(QWidget):
         os.makedirs(temp_dir, exist_ok=True)
 
         max_pages = self.pages_spin.value()
+        self.target_pages = max_pages
 
         # Сброс данных
         self.pages_content = {}
@@ -280,34 +286,37 @@ class PDFConverterUI(QWidget):
     def process_page_data(self, page_num: int, page_json: str):
         """Обработка данных страницы, полученных из потока"""
         try:
-            page_data = json.loads(page_json)
+            items = json.loads(page_json)  # <-- list[{type,text}]
+            page_data = {"page_number": page_num, "elements": items}
             self.pages_content[page_num] = page_data
 
             # Обновляем дерево структуры
             self.update_structure_tree(page_num, page_data)
 
-            # Обновляем комбобокс страниц
-            if page_num not in [self.page_combo.itemText(i) for i in range(self.page_combo.count())]:
-                self.page_combo.addItem(f"{page_num}")
+            # Комбобокс страниц: фикс int/str и дубли
+            existing = set()
+            for i in range(self.page_combo.count()):
+                t = self.page_combo.itemText(i)
+                if t.isdigit():
+                    existing.add(int(t))
+            if page_num not in existing:
+                self.page_combo.addItem(str(page_num))
 
-            # Если это первая страница, отображаем ее
+            # Если первая страница, показываем
             if page_num == 1:
                 self.display_page(1)
                 self.page_combo.setCurrentIndex(0)
 
-            # Обновляем навигацию
-            self.total_pages = max(self.pages_content.keys())
+            # total_pages больше НЕ через max(keys)
+            self.total_pages = getattr(self, "target_pages", self.pages_spin.value())
             self.page_label.setText(f"Страница: {self.current_page}/{self.total_pages}")
             self.update_navigation_buttons()
 
-            # Обновляем статус
             processed = len(self.pages_content)
             self.status_label.setText(f"Обработано: {processed}/{self.total_pages} страниц")
 
-            # Логируем успешную обработку страницы
             current_time = QDateTime.currentDateTime().toString("HH:mm:ss")
-            elements_count = len(page_data.get("elements", []))
-            self.logs_tab.append(f"[{current_time}] Страница {page_num} обработана ({elements_count} элементов)")
+            self.logs_tab.append(f"[{current_time}] Страница {page_num} обработана ({len(items)} элементов)")
 
         except Exception as e:
             current_time = QDateTime.currentDateTime().toString("HH:mm:ss")
@@ -700,116 +709,47 @@ class PDFConverterUI(QWidget):
         """Вставка форматированного элемента в текст"""
         elem_type = elem.get("type", "regular")
         text = elem.get("text", "")
-
         if not text.strip():
             return
 
-        # Создаем формат для элемента
         fmt = QTextCharFormat()
 
-        # Устанавливаем белый цвет по умолчанию для всех элементов
-        fmt.setForeground(QColor("#ffffff"))  # Белый цвет
+        # Цвет: монохром или по типу
+        if self.monochrome_mode:
+            fmt.setForeground(QColor("#ffffff"))
+        else:
+            fmt.setForeground(self.type_colors.get(elem_type, QColor("#ffffff")))
 
-        # Настройка шрифта
+        # Стиль
         if elem_type in ["header", "subheader"]:
             fmt.setFontWeight(QFont.Bold)
-            if elem_type == "header":
-                fmt.setFontPointSize(12)
-            else:
-                fmt.setFontPointSize(11)
-        elif elem_type == "bold_text" or elem.get("is_bold"):
+            fmt.setFontPointSize(12 if elem_type == "header" else 11)
+        elif elem_type == "bold_text":
             fmt.setFontWeight(QFont.Bold)
-        elif elem.get("is_italic"):
-            fmt.setFontItalic(True)
 
-        # Сохраняем исходные переносы строк - разбиваем текст на строки
-        lines = text.split('\n')
-        for i, line in enumerate(lines):
-            if line.strip():  # Пропускаем пустые строки
-                # Добавляем префиксы для некоторых типов (только для первой строки)
-                if i == 0:
-                    prefixes = {
-                        "header": f"\n# ",
-                        "subheader": f"\n## ",
-                        "task_number": f"\n▶ ",
-                        "answer_option": "   ○ ",
-                        "table": f"\n[ТАБЛИЦА]\n",
-                        "image_text": f"\n[ИЗОБРАЖЕНИЕ]\n"
-                    }
-
-                    prefix = prefixes.get(elem_type, "")
-                    if prefix:
-                        cursor.insertText(prefix, fmt)
-
-                # Вставляем строку текста
-                cursor.insertText(line, fmt)
-
-                # Добавляем перенос строки после каждой строки (кроме последней)
-                if i < len(lines) - 1:
-                    cursor.insertText("\n", fmt)
-
-        # Добавляем дополнительные переносы строк в зависимости от типа элемента
-        if elem_type in ["header", "subheader", "paragraph", "table", "image_text"]:
-            cursor.insertText("\n", fmt)
-        elif elem_type == "task_number":
-            cursor.insertText("\n", fmt)
-
-    def insert_formatted_element(self, cursor, elem: dict):
-        """Вставка форматированного элемента в текст"""
-        elem_type = elem.get("type", "regular")
-        text = elem.get("text", "")
-
-        if not text.strip():
-            return
-
-        # Создаем формат для элемента
-        fmt = QTextCharFormat()
-
-        # Устанавливаем цвет в зависимости от типа
-        if elem_type in self.type_colors:
-            fmt.setForeground(self.type_colors[elem_type])
-
-        # Настройка шрифта
-        if elem_type in ["header", "subheader"]:
-            fmt.setFontWeight(QFont.Bold)
-            if elem_type == "header":
-                fmt.setFontPointSize(12)
-            else:
-                fmt.setFontPointSize(11)
-        elif elem_type == "bold_text" or elem.get("is_bold"):
-            fmt.setFontWeight(QFont.Bold)
-        elif elem.get("is_italic"):
-            fmt.setFontItalic(True)
-
-        # Информация о шрифте (для отладки)
-        font_info = ""
-        if elem.get("font_size"):
-            font_info = f" [{elem['font_size']:.1f}pt]"
-
-        # Добавляем префиксы для некоторых типов
         prefixes = {
-            "header": f"\n# ",
-            "subheader": f"\n## ",
-            "task_number": f"\n▶ ",
+            "header": "\n# ",
+            "subheader": "\n## ",
+            "task_number": "\n▶ ",
             "answer_option": "   ○ ",
-            "table": f"\n[ТАБЛИЦА]{font_info}\n",
-            "image_text": f"\n[ИЗОБРАЖЕНИЕ]{font_info}\n"
+            "table": "\n[ТАБЛИЦА]\n",
+            "image_text": "\n[ИЗОБРАЖЕНИЕ]\n",
         }
-
         prefix = prefixes.get(elem_type, "")
         if prefix:
             cursor.insertText(prefix, fmt)
 
-        # Вставляем текст
-        cursor.insertText(text, fmt)
+        # сохраняем переносы строк
+        lines = text.split("\n")
+        for i, line in enumerate(lines):
+            cursor.insertText(line, fmt)
+            if i < len(lines) - 1:
+                cursor.insertText("\n", fmt)
 
-        # Добавляем перенос строки
         if elem_type in ["header", "subheader", "paragraph", "table", "image_text"]:
             cursor.insertText("\n", fmt)
         elif elem_type == "task_number":
             cursor.insertText("\n", fmt)
-
-
 
     def show_prev_page(self):
         if self.current_page > 1:
@@ -908,6 +848,36 @@ class PDFConverterUI(QWidget):
             except Exception as e:
                 self.status_label.setText(f"❌ Ошибка сохранения: {str(e)}")
 
+    def save_single_page_as_text(self, file_path: str, page_num: int):
+        page_data = self.pages_content.get(page_num)
+        if not page_data:
+            return
+
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(f"СТРАНИЦА {page_num}\n")
+            f.write("=" * 60 + "\n\n")
+
+            for elem in page_data.get("elements", []):
+                t = elem.get("type", "regular")
+                txt = elem.get("text", "")
+
+                if t == "header":
+                    f.write(f"# {txt}\n\n")
+                elif t == "subheader":
+                    f.write(f"## {txt}\n\n")
+                elif t == "task_number":
+                    f.write(f"▶ {txt}\n")
+                elif t == "answer_option":
+                    f.write(f"   ○ {txt}\n")
+                elif t == "table":
+                    f.write(f"[ТАБЛИЦА]\n{txt}\n\n")
+                elif t == "image_text":
+                    f.write(f"[ИЗОБРАЖЕНИЕ]\n{txt}\n\n")
+                elif t == "paragraph":
+                    f.write(f"{txt}\n\n")
+                else:
+                    f.write(f"{txt}\n")
+
     def save_as_text(self, file_path: str):
         """Сохранение в текстовом формате"""
         with open(file_path, "w", encoding="utf-8") as f:
@@ -972,7 +942,7 @@ class PDFConverterUI(QWidget):
 
         if file_dialog.exec():
             file_path = file_dialog.selectedFiles()[0]
-            self.save_as_text(file_path)
+            self.save_single_page_as_text(file_path, page_num)
             self.status_label.setText(f"✅ Страница {page_num} экспортирована")
 
 
