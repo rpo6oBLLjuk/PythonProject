@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QFont, QTextCharFormat, QColor, QTextCursor, QAction
 from PySide6.QtCore import Qt, QTimer, QDateTime
 
-from Scripts.PDFProcessor.pdf_converter import PDFConverterWithStructureThread
+from Scripts.PDFProcessor.pdf_converter import PdfParseThread
 
 from PyPDF2 import PdfReader
 
@@ -263,14 +263,15 @@ class PDFConverterUI(QWidget):
         self.logs_tab.append("-" * 50)
 
         # Создание и запуск потока
-        self.thread = PDFConverterWithStructureThread(
+        self.thread = PdfParseThread(
             self.pdf_input.text(),
             temp_dir,
             max_pages
         )
         self.thread.progress.connect(self.update_logs)
         self.thread.page_ready.connect(self.process_page_data)
-        self.thread.finished_conversion.connect(self.on_conversion_finished)
+        self.thread.finished.connect(self.on_conversion_finished)
+
         self.thread.start()
 
     def update_logs(self, message: str):
