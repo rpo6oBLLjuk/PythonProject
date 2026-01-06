@@ -1,23 +1,33 @@
 import os
-import PyPDF2
-import pdfplumber
-from pdfminer.high_level import extract_pages
-from pdfminer.layout import LTTextContainer, LTChar, LTRect, LTFigure
-from PIL import Image
-from pdf2image import convert_from_path
-import pytesseract
+import json
+from typing import Dict, Any, List, Callable, Optional
 
-from Scripts.Utils.logger import Logger
+import PyPDF2
 from PySide6.QtCore import QThread, Signal
 
-POPPLER_PATH = r'C:\Users\Admin\Documents\Github\PythonProject\Packages\poppler-25.12.0\Library\bin'
+from Scripts.Utils.logger import Logger
 
-class PDFConverterThread(QThread):
-    progress = Signal(str)        # Логи и статус по ходу
-    page_ready = Signal(int, list)  # Страница готова
-    finished_conversion = Signal(dict)  # Все результаты
+from .layout_extract import extract_lines_streaming
+from .structure_builder import build_chapters_from_pages, build_structured_json
+from .header_footer_filter import filter_headers_footers
+from .ocr_structure_builder import parse_scanned_pdf_ocr, OcrOptions
 
-    def __init__(self, pdf_path, temp_dir, max_pages):
+
+def _resolve_poppler_bin() -> str:
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    return os.path.join(project_root, "Packages", "poppler-25.12.0", "Library", "bin")
+
+
+def _empty_struct(source_file: str) -> Dict[str, Any]:
+    return {"source_file": source_file, "chapters": []}
+
+
+class PdfParseThread(QThread):
+    progress = Signal(str)
+    page_ready = Signal(int, str)   # page_num + JSON payload (progress/meta)
+    finished = Signal(str)          # structured json
+
+    def __init__(self, pdf_path: str, temp_dir: str, max_pages: int):
         super().__init__()
         self.pdf_path = pdf_path
         self.temp_dir = temp_dir
@@ -25,139 +35,189 @@ class PDFConverterThread(QThread):
         self.logger = Logger(console=False)
 
     def run(self):
-        self.logger.info("Запуск конвертации в отдельном потоке")
+        self.logger.info("Запуск парсинга PDF (главы/параграфы)")
+        source_file = os.path.basename(self.pdf_path)
+
         try:
-            result = convert_pdf_to_text(self.pdf_path, self.temp_dir, self.logger, self.max_pages, self.progress, self.page_ready)
-            self.finished_conversion.emit(result)
+            # early cancel
+            if self.isInterruptionRequested():
+                self.progress.emit("⛔ Отменено до старта")
+                self.finished.emit(json.dumps(_empty_struct(source_file), ensure_ascii=False))
+                return
+
+            doc = parse_pdf_document(
+                pdf_path=self.pdf_path,
+                temp_dir=self.temp_dir,
+                logger=self.logger,
+                max_pages=self.max_pages,
+                progress_signal=self.progress,
+                page_signal=self.page_ready,
+                cancel_check=self.isInterruptionRequested,
+            )
+
+            if self.isInterruptionRequested():
+                self.progress.emit("⛔ Отменено")
+                self.finished.emit(json.dumps(_empty_struct(source_file), ensure_ascii=False))
+                return
+
+            self.progress.emit("Конвертация завершена")
+            self.finished.emit(json.dumps(doc, ensure_ascii=False))
+
         except Exception as e:
             self.logger.error("Ошибка в потоке", e)
-            self.finished_conversion.emit({})
+            self.progress.emit(f"Ошибка: {str(e)}")
+            self.finished.emit(json.dumps(_empty_struct(source_file), ensure_ascii=False))
 
-def text_extraction(element, logger):
-    try:
-        text = element.get_text()
-        formats = []
-        for line in element:
-            if isinstance(line, LTTextContainer):
-                for char in line:
-                    if isinstance(char, LTChar):
-                        formats.append((char.fontname, char.size))
-        return text, list(set(formats))
-    except Exception as e:
-        logger.error("Ошибка извлечения текста", e)
-        return "", []
 
-def crop_image(element, pageObj, temp_dir, logger):
-    try:
-        path = os.path.join(temp_dir, "crop.pdf")
-        pageObj.mediabox.lower_left = (element.x0, element.y0)
-        pageObj.mediabox.upper_right = (element.x1, element.y1)
+def parse_pdf_document(
+    pdf_path: str,
+    temp_dir: str,
+    logger: Logger,
+    max_pages: int,
+    progress_signal=None,
+    page_signal=None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> Dict[str, Any]:
+    """
+    1) Text-layer extraction (fast)
+    2) Header/footer filter
+    3) If mostly empty -> OCR fallback
+    4) Else -> build chapters from extracted lines
+    5) Cooperative cancel via cancel_check()
+    """
 
-        writer = PyPDF2.PdfWriter()
-        writer.add_page(pageObj)
-        with open(path, "wb") as f:
-            writer.write(f)
-        return path
-    except Exception as e:
-        logger.error("Ошибка обрезки изображения", e)
-        return None
+    if cancel_check is None:
+        cancel_check = lambda: False
 
-def pdf_to_image(pdf_path, temp_dir, logger):
-    try:
-        images = convert_from_path(pdf_path, poppler_path=POPPLER_PATH)
-        if images:
-            img_path = os.path.join(temp_dir, "image.png")
-            images[0].save(img_path)
-            return img_path
-    except Exception as e:
-        logger.error("Ошибка конвертации PDF в изображение", e)
-    return None
+    source_file = os.path.basename(pdf_path)
+    os.makedirs(temp_dir, exist_ok=True)
 
-def image_to_text(image_path, logger):
-    try:
-        img = Image.open(image_path)
-        try:
-            return pytesseract.image_to_string(img, lang="rus")
-        except:
-            return pytesseract.image_to_string(img)
-    except Exception as e:
-        logger.error("Ошибка OCR", e)
-        return ""
-
-def extract_table(pdf_path, page_num, table_num, logger):
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            tables = pdf.pages[page_num].extract_tables()
-            if table_num < len(tables):
-                return tables[table_num]
-    except Exception as e:
-        logger.error("Ошибка извлечения таблицы", e)
-    return None
-
-def table_to_string(table):
-    return "\n".join(
-        "|" + "|".join(cell or "" for cell in row) + "|" for row in table
-    )
-
-def convert_pdf_to_text(pdf_path, temp_dir, logger, max_pages=None, progress_signal=None, page_signal=None):
-    text_per_page = {}
-
-    reader = PyPDF2.PdfReader(open(pdf_path, "rb"))
-    pages = list(extract_pages(pdf_path))
-    pages = pages[:max_pages] if max_pages else pages
-
-    for idx, page in enumerate(pages):
-        logger.info(f"Обработка страницы {idx + 1}")
+    def cancelled(msg: str) -> Dict[str, Any]:
         if progress_signal:
-            progress_signal.emit(f"Обработка страницы {idx + 1}")
+            progress_signal.emit(msg)
+        return _empty_struct(source_file)
 
-        pageObj = reader.pages[idx]
-        page_text, formats = [], []
-        images_text, tables_text = [], []
-        page_content = []
+    # --- total pages ---
+    try:
+        with open(pdf_path, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            total_pdf_pages = len(reader.pages)
+    except Exception as e:
+        logger.error("Не удалось прочитать PDF через PyPDF2", e)
+        if progress_signal:
+            progress_signal.emit(f"❌ Ошибка чтения PDF: {e}")
+        return _empty_struct(source_file)
 
-        elements = sorted(
-            [(el.y1, el) for el in page if hasattr(el, "y1")],
-            key=lambda x: x[0], reverse=True
+    total_pages = min(int(max_pages), int(total_pdf_pages))
+    if total_pages <= 0:
+        return _empty_struct(source_file)
+
+    if cancel_check():
+        return cancelled("⛔ Отменено до старта анализа")
+
+    # --- 1) extract text lines per page ---
+    pages_lines: List[list] = []
+
+    for page_idx, lines in enumerate(extract_lines_streaming(pdf_path, max_pages=total_pages, logger=logger)):
+        if cancel_check():
+            return cancelled("⛔ Отмена: остановка при извлечении текстового слоя")
+
+        pages_lines.append(lines)
+
+        if progress_signal:
+            progress_signal.emit(f"Страница {page_idx + 1}/{total_pages}: строк {len(lines)}")
+
+        # meta for UI
+        if page_signal:
+            try:
+                payload = {"page_number": page_idx + 1, "lines": len(lines)}
+                page_signal.emit(page_idx + 1, json.dumps(payload, ensure_ascii=False))
+            except Exception:
+                pass
+
+    if cancel_check():
+        return cancelled("⛔ Отмена: после извлечения текстового слоя")
+
+    # --- 2) filter headers/footers ---
+    try:
+        # поддержка обеих сигнатур
+        try:
+            pages_lines = filter_headers_footers(pages_lines, logger=logger)
+        except TypeError:
+            pages_lines = filter_headers_footers(pages_lines)
+    except Exception as e:
+        logger.error("Ошибка фильтра колонтитулов", e)
+
+    if cancel_check():
+        return cancelled("⛔ Отмена: после фильтра колонтитулов")
+
+    # пересчёт пустых страниц ПОСЛЕ фильтра
+    empty_count_after = sum(1 for p in pages_lines if not p)
+    empty_ratio = empty_count_after / max(1, len(pages_lines))
+
+    # --- 3) OCR fallback if mostly empty ---
+    if empty_ratio >= 0.70:
+        if progress_signal:
+            progress_signal.emit("Текстового слоя почти нет → OCR fallback")
+
+        opts = OcrOptions(
+            poppler_bin=_resolve_poppler_bin(),
+            dpi=300,
+            lang="rus",
+            grayscale=True,
+            use_pdftocairo=False,
         )
 
-        table_idx = 0
+        if cancel_check():
+            return cancelled("⛔ Отмена: перед OCR")
 
-        for _, el in elements:
-            if isinstance(el, LTTextContainer):
-                text, fmt = text_extraction(el, logger)
-                if text.strip():
-                    page_text.append(text)
-                    formats.append(fmt)
-                    page_content.append(text)
+        try:
+            # поддержка версий с/без cancel_check
+            try:
+                return parse_scanned_pdf_ocr(
+                    pdf_path=pdf_path,
+                    total_pages=total_pages,
+                    opts=opts,
+                    logger=logger,
+                    progress_signal=progress_signal,
+                    cancel_check=cancel_check,
+                )
+            except TypeError:
+                # legacy signature
+                return parse_scanned_pdf_ocr(
+                    pdf_path=pdf_path,
+                    total_pages=total_pages,
+                    opts=opts,
+                    logger=logger,
+                    progress_signal=progress_signal,
+                )
+        except Exception as e:
+            logger.error("OCR fallback упал", e)
+            if progress_signal:
+                progress_signal.emit(f"❌ OCR fallback ошибка: {e}")
+            return _empty_struct(source_file)
 
-            elif isinstance(el, LTFigure):
-                cropped = crop_image(el, pageObj, temp_dir, logger)
-                if cropped:
-                    img = pdf_to_image(cropped, temp_dir, logger)
-                    if img:
-                        text = image_to_text(img, logger)
-                        if text.strip():
-                            images_text.append(text)
-                            page_content.append(text)
+    # --- 4) build chapters normally ---
+    if cancel_check():
+        return cancelled("⛔ Отмена: перед сборкой структуры")
 
-            elif isinstance(el, LTRect):
-                table = extract_table(pdf_path, idx, table_idx, logger)
-                if table:
-                    table_text = table_to_string(table)
-                    tables_text.append(table_text)
-                    page_content.append(table_text)
-                    table_idx += 1
+    try:
+        try:
+            chapters = build_chapters_from_pages(pages_lines, logger=logger)
+        except TypeError:
+            chapters = build_chapters_from_pages(pages_lines)
+    except Exception as e:
+        logger.error("Ошибка сборки глав/параграфов", e)
+        if progress_signal:
+            progress_signal.emit(f"❌ Ошибка сборки структуры: {e}")
+        return _empty_struct(source_file)
 
-        text_per_page[f"Page_{idx}"] = [
-            page_text,
-            formats,
-            images_text,
-            tables_text,
-            page_content,
-        ]
+    if cancel_check():
+        return cancelled("⛔ Отмена: после сборки структуры")
 
-        if page_signal:
-            page_signal.emit(idx + 1, page_content)
+    try:
+        structured = build_structured_json(source_file=source_file, chapters=chapters)
+    except TypeError:
+        structured = build_structured_json(source_file, chapters)
 
-    return text_per_page
+    return structured
