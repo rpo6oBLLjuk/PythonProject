@@ -2,7 +2,11 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
+<<<<<<< HEAD
       <module fileurl="file://$PROJECT_DIR$/.idea/PythonProject.iml" filepath="$PROJECT_DIR$/.idea/PythonProject.iml" />
+=======
+      <module fileurl="file://$PROJECT_DIR$/.idea/PDFParser.iml" filepath="$PROJECT_DIR$/.idea/PDFParser.iml" />
+>>>>>>> bf12780 (init)
     </modules>
   </component>
 </project>
