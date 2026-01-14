@@ -1,61 +1,115 @@
 import os
+import json
 from pypdf import PdfReader, PdfWriter
 from dedoc import DedocManager
-import json
 
-# исходный PDF и коэффициенты
-INPUT_PDF = r"C:\Users\Admin\Documents\PDF_import\Azbuka_1_kl_1_ch_Goretskiy_compressed.pdf"
-TEMP_PDF = "subset.pdf"
-OUTPUT_JSON = "parsed_subset.json"
+from semantic_builder import build_semantic_hierarchy
 
-# указываем номера страниц, которые нужны
-# ВАЖНО: pypdf использует 0-индексацию, поэтому -1
-start_page = 4
-end_page = 5
 
-def extract_pages(input_pdf: str, output_pdf: str, start: int, end: int):
+# =========================
+# КОНФИГУРАЦИЯ
+# =========================
+
+INPUT_PDF = r"C:\Users\Admin\Documents\PDF_import\5a213f4f24_literatura-9-klass-1-chast.pdf"
+
+TEMP_PDF = "Temp\subset.pdf"
+
+RAW_JSON = "Json\parsed_subset.json"
+SEMANTIC_JSON = "Json\semantic_hierarchy.json"
+
+START_PAGE = 4
+END_PAGE = 20
+
+
+# =========================
+# PDF → SUBSET
+# =========================
+
+def extract_pages(
+    input_pdf: str,
+    output_pdf: str,
+    start_page: int,
+    end_page: int
+) -> None:
     """
-    Извлечь страницы [start, end] (1-индексация для пользователя)
+    Извлекает страницы [start_page, end_page] (1-индексация)
+    и сохраняет временный PDF.
     """
     reader = PdfReader(input_pdf)
     writer = PdfWriter()
 
-    # конвертируем в 0-индексацию
-    start_index = start - 1
-    end_index = end - 1
+    start_index = start_page - 1
+    end_index = end_page - 1
 
     for i in range(start_index, end_index + 1):
         if i < len(reader.pages):
             writer.add_page(reader.pages[i])
         else:
-            print(f"Страница {i+1} отсутствует в документе")
+            raise ValueError(f"Страница {i + 1} отсутствует в документе")
 
     with open(output_pdf, "wb") as f:
         writer.write(f)
 
-    print(f"Временный PDF с {start}–{end} сохранён как {output_pdf}")
-
-# сначала делаем "урезанный" PDF с нужными страницами
-extract_pages(INPUT_PDF, TEMP_PDF, start_page, end_page)
-
-# парсим получившийся PDF
-manager = DedocManager()
-
-params = {
-    "language": "rus"
-}
-
-result = manager.parse(file_path=TEMP_PDF, parameters=params)
+    print(f"[OK] Вырезаны страницы {start_page}–{end_page} → {output_pdf}")
 
 
-# приводим к словарю для JSON
-json_data = result.to_api_schema().model_dump()
+# =========================
+# SUBSET → DEDOC JSON
+# =========================
 
-# сохраняем JSON
-with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
-    json.dump(json_data, f, ensure_ascii=False, indent=2)
+def parse_pdf_with_dedoc(pdf_path: str) -> dict:
+    """
+    Парсит PDF через dedoc и возвращает JSON-словарь.
+    """
+    manager = DedocManager()
 
-print(f"Парсинг завершён. JSON в {OUTPUT_JSON}")
+    params = {
+        "language": "rus"
+    }
 
-# очищаем временный PDF (если не нужен)
-os.remove(TEMP_PDF)
+    result = manager.parse(file_path=pdf_path, parameters=params)
+    return result.to_api_schema().model_dump()
+
+
+def save_json(data: dict, path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    print(f"[OK] JSON сохранён: {path}")
+
+
+# =========================
+# ОСНОВНОЙ ПАЙПЛАЙН
+# =========================
+
+def run_pipeline() -> None:
+    # 1. Вырезаем страницы
+    extract_pages(
+        input_pdf=INPUT_PDF,
+        output_pdf=TEMP_PDF,
+        start_page=START_PAGE,
+        end_page=END_PAGE
+    )
+
+    try:
+        # 2. Парсим через dedoc
+        raw_json = parse_pdf_with_dedoc(TEMP_PDF)
+        save_json(raw_json, RAW_JSON)
+
+        # 3. Строим семантическую структуру
+        semantic = build_semantic_hierarchy(raw_json)
+        save_json(semantic, SEMANTIC_JSON)
+
+    finally:
+        # 4. Убираем временный PDF
+        if os.path.exists(TEMP_PDF):
+            os.remove(TEMP_PDF)
+            print(f"[OK] Временный файл удалён: {TEMP_PDF}")
+
+
+# =========================
+# ENTRY POINT
+# =========================
+
+if __name__ == "__main__":
+    run_pipeline()
