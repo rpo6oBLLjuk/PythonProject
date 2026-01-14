@@ -5,36 +5,34 @@ import numpy as np
 
 
 # ======================================================
-# СЛУЖЕБНЫЕ УТИЛИТЫ
+# УТИЛИТЫ
 # ======================================================
 
 MARKER_RE = re.compile(r'^[®@Ф\\#]+\s+')
 
 
 def strip_leading_markers(text: str) -> str:
-    """
-    Убирает ведущие служебные маркеры вида:
-    '® Текст', '@@   Текст', 'Ф  Текст'
-    """
     return MARKER_RE.sub('', text).strip()
 
 
-def merge_adjacent_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def merge_adjacent_text(blocks: List[Any]) -> List[Any]:
     """
-    Склеивает подряд идущие блоки одного типа.
+    Склеивает подряд идущие текстовые строки.
+    Узлы (dict с content) не трогает.
     """
     if not blocks:
         return []
 
-    merged = [blocks[0].copy()]
+    merged: List[Any] = [blocks[0]]
 
-    for block in blocks[1:]:
+    for b in blocks[1:]:
         last = merged[-1]
 
-        if block["type"] == last["type"]:
-            last["text"] += "\n" + block["text"]
+        # строка + строка → склеиваем
+        if isinstance(last, str) and isinstance(b, str):
+            merged[-1] = last + "\n" + b
         else:
-            merged.append(block.copy())
+            merged.append(b)
 
     return merged
 
@@ -43,35 +41,39 @@ def merge_adjacent_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # СБОР ПРИЗНАКОВ
 # ======================================================
 
-def collect_font_sizes(node: Dict[str, Any], acc: List[float]):
+def collect_sizes_and_spacings(node: Dict[str, Any], sizes: List[float], spacings: List[float]):
     for ann in node.get("annotations", []):
         if ann["name"] == "size":
             try:
-                acc.append(float(ann["value"]))
+                sizes.append(float(ann["value"]))
             except ValueError:
                 pass
-    for child in node.get("subparagraphs", []):
-        collect_font_sizes(child, acc)
-
-
-def collect_spacings(node: Dict[str, Any], acc: List[float]):
-    for ann in node.get("annotations", []):
-        if ann["name"] == "spacing":
+        elif ann["name"] == "spacing":
             try:
-                acc.append(float(ann["value"]))
+                spacings.append(float(ann["value"]))
             except ValueError:
                 pass
+
     for child in node.get("subparagraphs", []):
-        collect_spacings(child, acc)
+        collect_sizes_and_spacings(child, sizes, spacings)
 
 
-def max_font_size(node: Dict[str, Any]) -> float:
-    sizes = [
+def max_size(node: Dict[str, Any]) -> float:
+    vals = [
         float(a["value"])
         for a in node.get("annotations", [])
         if a["name"] == "size"
     ]
-    return max(sizes) if sizes else 0
+    return max(vals) if vals else 0
+
+
+def max_spacing(node: Dict[str, Any]) -> float:
+    vals = [
+        float(a["value"])
+        for a in node.get("annotations", [])
+        if a["name"] == "spacing"
+    ]
+    return max(vals) if vals else 0
 
 
 # ======================================================
@@ -80,77 +82,48 @@ def max_font_size(node: Dict[str, Any]) -> float:
 
 class FontProfile:
     """
-    Устойчивый профиль шрифтов для учебников.
+    Профиль документа для вычисления уровней заголовков.
     """
 
-    def __init__(self, raw_sizes: List[float], raw_spacings: List[float]):
-        self.sizes = self._normalize_sizes(raw_sizes)
+    def __init__(self, sizes: List[float], spacings: List[float]):
+        self.sizes = [s for s in sizes if 8 <= s <= 80]
+        self.spacings = [s for s in spacings if 10 <= s <= 300]
 
         if not self.sizes:
-            raise ValueError("Нет валидных размеров шрифтов")
+            raise ValueError("Нет валидных размеров")
 
-        self.median = median(self.sizes)
+        self.p50 = median(self.sizes)
         self.p75 = np.percentile(self.sizes, 75)
         self.p90 = np.percentile(self.sizes, 90)
 
-        # пороги по размеру
-        self.chapter_threshold = self.p90
-        self.section_threshold = max(self.p75, self.median * 1.15)
-
-        # порог по spacing
-        spacings = [s for s in raw_spacings if 10 <= s <= 300]
-        self.spacing_chapter_threshold = (
-            np.percentile(spacings, 75) if spacings else 40
+        self.spacing_ref = (
+            np.percentile(self.spacings, 75) if self.spacings else 40
         )
 
-    @staticmethod
-    def _normalize_sizes(sizes: List[float]) -> List[float]:
-        """
-        Убирает OCR-мусор и декоративные элементы.
-        """
-        return [s for s in sizes if 8 <= s <= 80]
+    def heading_level(self, size: float, spacing: float, text: str) -> int:
+        text = text.strip()
 
+        # --- жёсткие фильтры ---
+        if not text:
+            return -1
 
-# ======================================================
-# КЛАССИФИКАЦИЯ
-# ======================================================
+        if text.isdigit():
+            return -1
 
-def classify(node: Dict[str, Any], profile: FontProfile) -> str:
-    raw_text = node.get("text", "")
-    text = strip_leading_markers(raw_text)
+        if len(text) > 120:
+            return -1
 
-    if not text:
-        return "ignore"
+        # --- собственно уровни ---
+        if size >= self.p90 and spacing >= self.spacing_ref:
+            return 0
 
-    size = max_font_size(node)
+        if size >= self.p75 and spacing >= self.spacing_ref * 0.7:
+            return 1
 
-    # защита от OCR-мусора
-    if size < 8 or size > 80:
-        return "ignore"
+        if size >= self.p75:
+            return 2
 
-    spacing_values = [
-        float(a["value"])
-        for a in node.get("annotations", [])
-        if a["name"] == "spacing"
-    ]
-    spacing = max(spacing_values) if spacing_values else 0
-
-    # ---------
-    # ГЛАВА
-    # ---------
-    if (
-        size >= profile.chapter_threshold
-        and spacing >= profile.spacing_chapter_threshold
-    ):
-        return "chapter"
-
-    # ---------
-    # РАЗДЕЛ
-    # ---------
-    if size >= profile.section_threshold:
-        return "section"
-
-    return "text"
+        return -1
 
 
 # ======================================================
@@ -160,70 +133,77 @@ def classify(node: Dict[str, Any], profile: FontProfile) -> str:
 def build_semantic_hierarchy(dedoc_json: Dict[str, Any]) -> Dict[str, Any]:
     root = dedoc_json["content"]["structure"]
 
-    # --- сбор статистики ---
     sizes: List[float] = []
     spacings: List[float] = []
-
-    collect_font_sizes(root, sizes)
-    collect_spacings(root, spacings)
+    collect_sizes_and_spacings(root, sizes, spacings)
 
     profile = FontProfile(sizes, spacings)
 
     document = {"chapters": []}
+    node_stack: List[Dict[str, Any]] = []
 
-    current_chapter = None
-    current_section = None
+    def push_node(text: str, level: int):
+        nonlocal node_stack
+
+        if level == 0:
+            node = {
+                "chapter": text,
+                "content": []
+            }
+        elif level == 1:
+            node = {
+                "part": text,
+                "content": []
+            }
+        else:
+            node = {
+                "name": text,
+                "content": []
+            }
+
+        while len(node_stack) > level:
+            node_stack.pop()
+
+        if node_stack:
+            node_stack[-1]["content"].append(node)
+        else:
+            document["chapters"].append(node)
+
+        node_stack.append(node)
+
+    def add_text(text: str):
+        if not node_stack:
+            return
+
+        node_stack[-1]["content"].append(text)
 
     def walk(node: Dict[str, Any]):
-        nonlocal current_chapter, current_section
+        raw = node.get("text", "")
+        text = strip_leading_markers(raw)
 
-        raw_text = node.get("text", "")
-        text = strip_leading_markers(raw_text)
-        kind = classify(node, profile)
+        if text:
+            size = max_size(node)
+            spacing = max_spacing(node)
+            level = profile.heading_level(size, spacing, text)
 
-        if kind == "chapter":
-            current_chapter = {
-                "type": "chapter",
-                "title": text,
-                "sections": [],
-                "content": []
-            }
-            document["chapters"].append(current_chapter)
-            current_section = None
-
-        elif kind == "section" and current_chapter:
-            current_section = {
-                "type": "section",
-                "title": text,
-                "content": []
-            }
-            current_chapter["sections"].append(current_section)
-
-        elif kind == "text":
-            target = None
-
-            if current_section:
-                target = current_section["content"]
-            elif current_chapter:
-                target = current_chapter["content"]
-
-            if target is not None:
-                target.append({
-                    "type": "text",
-                    "text": text
-                })
+            if level != -1:
+                push_node(text, level)
+            else:
+                add_text(text)
 
         for child in node.get("subparagraphs", []):
             walk(child)
 
-    # --- обход дерева ---
     walk(root)
 
-    # --- пост-обработка: слияние блоков ---
-    for chapter in document.get("chapters", []):
-        chapter["content"] = merge_adjacent_blocks(chapter.get("content", []))
+    # пост-обработка: склейка текста
+    def normalize(node: Dict[str, Any]):
+        node["content"] = merge_adjacent_text(node["content"])
+        for item in node["content"]:
+            if isinstance(item, dict) and "content" in item:
+                normalize(item)
 
-        for section in chapter.get("sections", []):
-            section["content"] = merge_adjacent_blocks(section.get("content", []))
+    for ch in document["chapters"]:
+        normalize(ch)
 
     return document
