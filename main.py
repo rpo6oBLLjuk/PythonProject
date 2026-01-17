@@ -17,40 +17,58 @@ TEMP_PDF = "Temp\subset.pdf"
 RAW_JSON = "Json\parsed_subset.json"
 SEMANTIC_JSON = "Json\semantic_hierarchy.json"
 
-START_PAGE = 4
-END_PAGE = 20
+START_PAGE = 0
+END_PAGE = 420
 
 
 # =========================
 # PDF → SUBSET
 # =========================
 
+from pypdf import PdfReader, PdfWriter
+
+
 def extract_pages(
     input_pdf: str,
     output_pdf: str,
     start_page: int,
     end_page: int
-) -> None:
+):
     """
-    Извлекает страницы [start_page, end_page] (1-индексация)
-    и сохраняет временный PDF.
+    Извлекает страницы [start_page, end_page] (1-индексация),
+    автоматически зажимая диапазон в пределах документа.
     """
+
     reader = PdfReader(input_pdf)
     writer = PdfWriter()
 
-    start_index = start_page - 1
-    end_index = end_page - 1
+    total_pages = len(reader.pages)
 
-    for i in range(start_index, end_index + 1):
-        if i < len(reader.pages):
-            writer.add_page(reader.pages[i])
-        else:
-            raise ValueError(f"Страница {i + 1} отсутствует в документе")
+    # --- нормализация диапазона ---
+    start = max(1, start_page)
+    end = min(end_page, total_pages)
+
+    if start > end:
+        print(
+            f"[WARN] Диапазон пуст: start={start_page}, "
+            f"end={end_page}, pages={total_pages}"
+        )
+        return False
+
+    # --- извлечение ---
+    for page_num in range(start - 1, end):
+        writer.add_page(reader.pages[page_num])
 
     with open(output_pdf, "wb") as f:
         writer.write(f)
 
-    print(f"[OK] Вырезаны страницы {start_page}–{end_page} → {output_pdf}")
+    print(
+        f"[OK] Извлечены страницы {start}–{end} "
+        f"(из {total_pages}) → {output_pdf}"
+    )
+
+    return True
+
 
 
 # =========================

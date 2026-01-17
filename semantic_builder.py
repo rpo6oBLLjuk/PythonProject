@@ -3,9 +3,10 @@ from typing import Dict, Any, List
 from statistics import median
 import numpy as np
 
+from toc_parser import parse_toc
 
 # ======================================================
-# УТИЛИТЫ
+# УТИЛИТЫ ТЕКСТА
 # ======================================================
 
 MARKER_RE = re.compile(r'^[®@Ф\\#]+\s+')
@@ -15,33 +16,52 @@ def strip_leading_markers(text: str) -> str:
     return MARKER_RE.sub('', text).strip()
 
 
-def merge_adjacent_text(blocks: List[Any]) -> List[Any]:
-    """
-    Склеивает подряд идущие текстовые строки.
-    Узлы (dict с content) не трогает.
-    """
-    if not blocks:
+def is_noise(text: str) -> bool:
+    t = text.strip()
+
+    if not t:
+        return True
+
+    if t.isdigit():
+        return True
+
+    if len(t) <= 2 and not t.isalpha():
+        return True
+
+    return False
+
+
+def normalize_text(text: str) -> str:
+    text = re.sub(r'-\s*\n\s*', '', text)
+    text = text.replace('\r\n', '\n')
+    text = re.sub(r'\n{2,}', '\n\n', text)
+    text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = re.sub(r' *\n *', '\n', text)
+    return text.strip()
+
+
+def merge_adjacent_text(block_content: List[str]) -> List[str]:
+    if not block_content:
         return []
 
-    merged: List[Any] = [blocks[0]]
+    text = "\n\n".join(
+        normalize_text(t)
+        for t in block_content
+        if t.strip()
+    )
 
-    for b in blocks[1:]:
-        last = merged[-1]
-
-        # строка + строка → склеиваем
-        if isinstance(last, str) and isinstance(b, str):
-            merged[-1] = last + "\n" + b
-        else:
-            merged.append(b)
-
-    return merged
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return [text]
 
 
 # ======================================================
 # СБОР ПРИЗНАКОВ
 # ======================================================
 
-def collect_sizes_and_spacings(node: Dict[str, Any], sizes: List[float], spacings: List[float]):
+def collect_sizes_and_spacings(node: Dict[str, Any],
+                               sizes: List[float],
+                               spacings: List[float]):
     for ann in node.get("annotations", []):
         if ann["name"] == "size":
             try:
@@ -81,10 +101,6 @@ def max_spacing(node: Dict[str, Any]) -> float:
 # ======================================================
 
 class FontProfile:
-    """
-    Профиль документа для вычисления уровней заголовков.
-    """
-
     def __init__(self, sizes: List[float], spacings: List[float]):
         self.sizes = [s for s in sizes if 8 <= s <= 80]
         self.spacings = [s for s in spacings if 10 <= s <= 300]
@@ -101,26 +117,18 @@ class FontProfile:
         )
 
     def heading_level(self, size: float, spacing: float, text: str) -> int:
-        text = text.strip()
+        t = text.strip()
 
-        # --- жёсткие фильтры ---
-        if not text:
+        if len(t) > 120:
+            return -1
+        if t.count('.') >= 2:
             return -1
 
-        if text.isdigit():
-            return -1
-
-        if len(text) > 120:
-            return -1
-
-        # --- собственно уровни ---
         if size >= self.p90 and spacing >= self.spacing_ref:
             return 0
-
-        if size >= self.p75 and spacing >= self.spacing_ref * 0.7:
-            return 1
-
         if size >= self.p75:
+            return 1
+        if size >= self.p50 * 1.1:
             return 2
 
         return -1
@@ -131,6 +139,9 @@ class FontProfile:
 # ======================================================
 
 def build_semantic_hierarchy(dedoc_json: Dict[str, Any]) -> Dict[str, Any]:
+    toc_map = parse_toc(dedoc_json)
+    print(f"[TOC] Найдено элементов: {len(toc_map)}")
+
     root = dedoc_json["content"]["structure"]
 
     sizes: List[float] = []
@@ -140,70 +151,124 @@ def build_semantic_hierarchy(dedoc_json: Dict[str, Any]) -> Dict[str, Any]:
     profile = FontProfile(sizes, spacings)
 
     document = {"chapters": []}
-    node_stack: List[Dict[str, Any]] = []
 
-    def push_node(text: str, level: int):
-        nonlocal node_stack
+    current_chapter = None
+    current_part = None
+    current_block = None
+    chapter_has_content = False   # <<< ДОБАВЛЕНО
 
-        if level == 0:
-            node = {
-                "chapter": text,
+    # ---------------- helpers ----------------
+
+    def ensure_chapter(title: str = "Без названия"):
+        nonlocal current_chapter, current_part, current_block, chapter_has_content
+        if current_chapter is None:
+            current_chapter = {
+                "chapter": title,
                 "content": []
             }
-        elif level == 1:
-            node = {
-                "part": text,
+            document["chapters"].append(current_chapter)
+            current_part = None
+            current_block = None
+            chapter_has_content = False   # <<<
+
+    def ensure_part(name=None):
+        nonlocal current_part, current_block
+        if current_part is None:
+            current_part = {
+                "part": name,
                 "content": []
             }
-        else:
-            node = {
-                "name": text,
+            current_chapter["content"].append(current_part)
+            current_block = None
+
+    def ensure_block(name=None):
+        nonlocal current_block
+        ensure_part()
+        if current_block is None:
+            current_block = {
+                "block": name,
                 "content": []
             }
+            current_part["content"].append(current_block)
 
-        while len(node_stack) > level:
-            node_stack.pop()
-
-        if node_stack:
-            node_stack[-1]["content"].append(node)
-        else:
-            document["chapters"].append(node)
-
-        node_stack.append(node)
-
-    def add_text(text: str):
-        if not node_stack:
-            return
-
-        node_stack[-1]["content"].append(text)
+    # ---------------- walk ----------------
 
     def walk(node: Dict[str, Any]):
+        nonlocal current_chapter, current_part, current_block, chapter_has_content
+
         raw = node.get("text", "")
         text = strip_leading_markers(raw)
 
         if text:
-            size = max_size(node)
-            spacing = max_spacing(node)
-            level = profile.heading_level(size, spacing, text)
-
-            if level != -1:
-                push_node(text, level)
+            if is_noise(text):
+                pass
             else:
-                add_text(text)
+                size = max_size(node)
+                spacing = max_spacing(node)
+
+                normalized = normalize_text(text)
+
+                if normalized in toc_map:
+                    print("[TOC MATCH]", repr(normalized))
+                    level = toc_map[normalized]
+                else:
+                    level = profile.heading_level(size, spacing, text)
+
+                # --------- ГЛАВА (ИСПРАВЛЕНИЕ ЗДЕСЬ) ---------
+                if level == 0:
+                    if current_chapter is None or not chapter_has_content:
+                        current_chapter = {
+                            "chapter": text,
+                            "content": []
+                        }
+                        document["chapters"].append(current_chapter)
+                        current_part = None
+                        current_block = None
+                        chapter_has_content = False
+                    else:
+                        ensure_chapter()
+                        ensure_part()
+                        current_block = {
+                            "block": text,
+                            "content": []
+                        }
+                        current_part["content"].append(current_block)
+
+                elif level == 1:
+                    ensure_chapter()
+                    current_part = {
+                        "part": text,
+                        "content": []
+                    }
+                    current_chapter["content"].append(current_part)
+                    current_block = None
+
+                elif level == 2:
+                    ensure_chapter()
+                    ensure_part()
+                    current_block = {
+                        "block": text,
+                        "content": []
+                    }
+                    current_part["content"].append(current_block)
+
+                else:
+                    ensure_chapter()
+                    ensure_part()
+                    ensure_block()
+                    current_block["content"].append(text)
+                    chapter_has_content = True   # <<< ВАЖНО
 
         for child in node.get("subparagraphs", []):
             walk(child)
 
     walk(root)
 
-    # пост-обработка: склейка текста
-    def normalize(node: Dict[str, Any]):
-        node["content"] = merge_adjacent_text(node["content"])
-        for item in node["content"]:
-            if isinstance(item, dict) and "content" in item:
-                normalize(item)
+    # ---------------- normalize ----------------
 
     for ch in document["chapters"]:
-        normalize(ch)
+        for part in ch["content"]:
+            for block in part["content"]:
+                block["content"] = merge_adjacent_text(block["content"])
 
     return document
