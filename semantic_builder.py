@@ -1,147 +1,100 @@
-import re
-from typing import Dict, Any, List
+import json
+from typing import Dict, Any, List, Optional
 from statistics import median
-import numpy as np
 
-from toc_parser import parse_toc
-from text_utils import normalize_key, strip_leading_markers, normalize_text
-
+from text_utils import (
+    strip_leading_markers,
+    normalize_text
+)
 
 
 # ======================================================
-# ТЕКСТОВЫЕ УТИЛИТЫ
+# ИЗВЛЕЧЕНИЕ ПРИЗНАКОВ ИЗ DEDOC
 # ======================================================
 
-MARKER_RE = re.compile(r'^[®@Ф\\#]+\s+')
+def extract_max_size(node: Dict[str, Any]) -> float:
+    """
+    Максимальный размер шрифта в узле
+    """
+    sizes = []
+    for ann in node.get("annotations", []):
+        if ann.get("name") == "size":
+            try:
+                sizes.append(float(ann["value"]))
+            except ValueError:
+                pass
+    return max(sizes) if sizes else 0.0
 
 
-def strip_leading_markers(text: str) -> str:
-    return MARKER_RE.sub('', text).strip()
+def normalize_size(size: float, step: float = 0.5) -> float:
+    """
+    Квантизация размера шрифта для устранения шума (14 ↔ 15)
+    """
+    if size <= 0:
+        return 0.0
+    return round(size / step) * step
 
 
-def normalize_text(text: str) -> str:
-    text = re.sub(r'-\s*\n\s*', '', text)
-    text = text.replace('\r\n', '\n')
-    text = re.sub(r'\n{2,}', '\n\n', text)
-    text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)
-    text = re.sub(r'[ \t]{2,}', ' ', text)
-    text = re.sub(r' *\n *', '\n', text)
-    return text.strip()
+def extract_spacing(node: Dict[str, Any]) -> float:
+    """
+    Межстрочный / межблочный интервал, если dedoc его дал
+    """
+    for ann in node.get("annotations", []):
+        if ann.get("name") == "spacing":
+            try:
+                return float(ann["value"])
+            except ValueError:
+                pass
+    return 0.0
 
 
-def normalize_key(text: str) -> str:
-    if not text:
-        return ""
+def extract_y_px(node: Dict[str, Any]) -> Optional[float]:
+    for ann in node.get("annotations", []):
+        if ann.get("name") == "bounding box":
+            try:
+                value = ann.get("value")
 
-    text = strip_leading_markers(text)
-    text = re.sub(r'\.{2,}', ' ', text)
-    text = re.sub(r'\s+\d{1,4}\s*$', '', text)
-    text = normalize_text(text)
+                if isinstance(value, str):
+                    bb = json.loads(value)
+                elif isinstance(value, dict):
+                    bb = value
+                else:
+                    continue
 
-    text = (
-        text.replace('«', '')
-            .replace('»', '')
-            .replace('"', '')
-            .replace("'", '')
-    )
+                y_norm = bb.get("y_top_left")
+                page_h = bb.get("page_height")
 
-    return text.strip()
+                if y_norm is not None and page_h:
+                    return float(y_norm) * float(page_h)
 
+            except Exception:
+                pass
+    return None
+
+
+def extract_page(node: Dict[str, Any]) -> Optional[int]:
+    return node.get("metadata", {}).get("page_id")
+
+
+# ======================================================
+# ФИЛЬТРАЦИЯ МУСОРА
+# ======================================================
 
 def is_noise(text: str) -> bool:
     t = text.strip()
+
     if not t:
         return True
+
+    # номера страниц
     if t.isdigit():
         return True
+
+    # короткий мусор
     if len(t) <= 2 and not t.isalpha():
         return True
+
     return False
-
-
-def merge_adjacent_text(block_content: List[str]) -> List[str]:
-    if not block_content:
-        return []
-
-    text = "\n\n".join(
-        normalize_text(t)
-        for t in block_content
-        if t.strip()
-    )
-
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return [text]
-
-
-# ======================================================
-# СБОР ПРИЗНАКОВ
-# ======================================================
-
-def collect_sizes_and_spacings(node: Dict[str, Any],
-                               sizes: List[float],
-                               spacings: List[float]):
-    for ann in node.get("annotations", []):
-        try:
-            if ann["name"] == "size":
-                sizes.append(float(ann["value"]))
-            elif ann["name"] == "spacing":
-                spacings.append(float(ann["value"]))
-        except ValueError:
-            pass
-
-    for child in node.get("subparagraphs", []):
-        collect_sizes_and_spacings(child, sizes, spacings)
-
-
-def max_size(node: Dict[str, Any]) -> float:
-    vals = [
-        float(a["value"])
-        for a in node.get("annotations", [])
-        if a["name"] == "size"
-    ]
-    return max(vals) if vals else 0.0
-
-
-def max_spacing(node: Dict[str, Any]) -> float:
-    vals = [
-        float(a["value"])
-        for a in node.get("annotations", [])
-        if a["name"] == "spacing"
-    ]
-    return max(vals) if vals else 0.0
-
-
-# ======================================================
-# ПРОФИЛЬ ШРИФТА
-# ======================================================
-
-class FontProfile:
-    def __init__(self, sizes: List[float], spacings: List[float]):
-        self.sizes = [s for s in sizes if 8 <= s <= 80]
-        self.spacings = [s for s in spacings if 10 <= s <= 300]
-
-        if not self.sizes:
-            raise ValueError("Нет валидных размеров")
-
-        self.p50 = median(self.sizes)
-        self.p75 = np.percentile(self.sizes, 75)
-        self.p90 = np.percentile(self.sizes, 90)
-        self.spacing_ref = np.percentile(self.spacings, 75) if self.spacings else 40
-
-    def heading_level(self, size: float, spacing: float, text: str) -> int:
-        t = text.strip()
-        if len(t) > 120:
-            return -1
-        if t.count('.') >= 2:
-            return -1
-
-        if size >= self.p90 and spacing >= self.spacing_ref:
-            return 0
-        if size >= self.p75:
-            return 1
-        if size >= self.p50 * 1.1:
-            return 2
-        return -1
 
 
 # ======================================================
@@ -149,110 +102,98 @@ class FontProfile:
 # ======================================================
 
 def build_semantic_hierarchy(dedoc_json: Dict[str, Any]) -> Dict[str, Any]:
-    toc_map = parse_toc(dedoc_json)
-    print(f"[TOC] Найдено элементов: {len(toc_map)}")
+    """
+    Формирует ПЛОСКИЙ список блоков:
+
+    {
+      "blocks": [
+        {
+          "text": str,
+          "size": float,
+          "spacing": float,
+          "dy": float | None,
+          "dy_norm": float | None,
+          "page": int
+        }
+      ]
+    }
+    """
 
     root = dedoc_json["content"]["structure"]
 
-    sizes, spacings = [], []
-    collect_sizes_and_spacings(root, sizes, spacings)
-    profile = FontProfile(sizes, spacings)
+    blocks: List[Dict[str, Any]] = []
 
-    document = {"chapters": []}
+    prev_y: Optional[float] = None
+    prev_page: Optional[int] = None
 
-    current_chapter = None
-    current_part = None
-    current_block = None
-    chapter_has_content = False
+    # временно собираем dy для нормализации
+    raw_dy_values: List[float] = []
 
-    # ---------------- helpers ----------------
+    # ---------------- обход документа ----------------
 
-    def ensure_chapter(title="Без названия"):
-        nonlocal current_chapter, current_part, current_block, chapter_has_content
-        if current_chapter is None:
-            current_chapter = {"chapter": title, "content": []}
-            document["chapters"].append(current_chapter)
-            current_part = None
-            current_block = None
-            chapter_has_content = False
-
-    def ensure_part(name=None):
-        nonlocal current_part, current_block
-        if current_part is None:
-            current_part = {"part": name, "content": []}
-            current_chapter["content"].append(current_part)
-            current_block = None
-
-    def ensure_block(name=None):
-        nonlocal current_block
-        ensure_part()
-        if current_block is None:
-            current_block = {"block": name, "content": []}
-            current_part["content"].append(current_block)
-
-    # ---------------- walk ----------------
-
-    def walk(node):
-        nonlocal current_chapter, current_part, current_block, chapter_has_content
+    def walk(node: Dict[str, Any]):
+        nonlocal prev_y, prev_page
 
         raw = node.get("text", "")
         text = strip_leading_markers(raw)
 
-        if text and not is_noise(text):
-            key = normalize_key(text)
-            size = max_size(node)
-            spacing = max_spacing(node)
+        if text:
+            text = normalize_text(text)
 
-            if key in toc_map:
-                level = toc_map[key]
-                force = True
-                print(f"[TOC MATCH] level={level} :: {text}")
-            else:
-                level = profile.heading_level(size, spacing, text)
-                force = False
+            if not is_noise(text):
+                size_raw = extract_max_size(node)
+                size = normalize_size(size_raw)
 
-            if level == 0:
-                if force or current_chapter is None or not chapter_has_content:
-                    current_chapter = {"chapter": text, "content": []}
-                    document["chapters"].append(current_chapter)
-                    current_part = None
-                    current_block = None
-                    chapter_has_content = False
-                else:
-                    ensure_chapter()
-                    ensure_part()
-                    current_block = {"block": text, "content": []}
-                    current_part["content"].append(current_block)
+                spacing = extract_spacing(node)
+                y = extract_y_px(node)
+                page = extract_page(node)
 
-            elif level == 1:
-                ensure_chapter()
-                current_part = {"part": text, "content": []}
-                current_chapter["content"].append(current_part)
-                current_block = None
+                dy: Optional[float] = None
 
-            elif level == 2:
-                ensure_chapter()
-                ensure_part()
-                current_block = {"block": text, "content": []}
-                current_part["content"].append(current_block)
+                if (
+                    y is not None
+                    and prev_y is not None
+                    and page is not None
+                    and page == prev_page
+                ):
+                    delta = y - prev_y
+                    if delta > 0:
+                        dy = delta
+                        raw_dy_values.append(delta)
 
-            else:
-                ensure_chapter()
-                ensure_part()
-                ensure_block()
-                current_block["content"].append(text)
-                chapter_has_content = True
+                blocks.append({
+                    "text": text,
+                    "size": size,
+                    "spacing": spacing,
+                    "dy": dy,
+                    "dy_norm": None,   # заполним позже
+                    "page": page
+                })
 
-        for ch in node.get("subparagraphs", []):
-            walk(ch)
+                if y is not None:
+                    prev_y = y
+                    prev_page = page
+
+        for child in node.get("subparagraphs", []):
+            walk(child)
 
     walk(root)
 
-    # ---------------- normalize ----------------
+    # ---------------- нормализация dy ----------------
 
-    for ch in document["chapters"]:
-        for part in ch["content"]:
-            for block in part["content"]:
-                block["content"] = merge_adjacent_text(block["content"])
+    if raw_dy_values:
+        median_line_height = median(raw_dy_values)
+    else:
+        median_line_height = None
 
-    return document
+    if median_line_height and median_line_height > 0:
+        for block in blocks:
+            if block["dy"] is not None:
+                block["dy_norm"] = block["dy"] / median_line_height
+    else:
+        for block in blocks:
+            block["dy_norm"] = None
+
+    return {
+        "blocks": blocks
+    }
