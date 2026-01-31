@@ -71,10 +71,6 @@ def is_noise(text: str) -> bool:
 
 
 def looks_like_heading(text: str) -> bool:
-    """
-    Короткий номинативный заголовок.
-    Никаких правил про регистр.
-    """
     if len(text) > 120:
         return False
     if text.count('.') >= 2:
@@ -83,17 +79,10 @@ def looks_like_heading(text: str) -> bool:
 
 
 # ======================================================
-# СКЛЕЙКА СТРОК (КЛЮЧЕВОЙ БЛОК)
+# СКЛЕЙКА ФИЗИЧЕСКИХ СТРОК
 # ======================================================
 
 def merge_lines(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Склеивает физические строки в логические.
-    Решает:
-    - курсив
-    - переносы слов
-    - разрывы одной строки на несколько node
-    """
     merged: List[Dict[str, Any]] = []
 
     for b in blocks:
@@ -103,7 +92,6 @@ def merge_lines(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         last = merged[-1]
 
-        # критерии "продолжения строки"
         same_size = abs(last["size"] - b["size"]) <= 0.5
         close_vertically = (
             last["dy_norm"] is not None and
@@ -112,14 +100,13 @@ def merge_lines(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         )
 
         if same_size and close_vertically:
-            # перенос слова
+            # перенос с дефисом
             if last["text"].endswith("-"):
                 last["text"] = last["text"][:-1] + b["text"]
             else:
-                last["text"] += " " + b["text"]
+                last["text"] += "\n" + b["text"]
             continue
 
-        # новая логическая строка
         merged.append(b)
 
     return merged
@@ -144,7 +131,7 @@ def build_semantic_hierarchy(dedoc_json: Dict[str, Any]) -> Dict[str, Any]:
         nonlocal prev_y, prev_page
 
         raw = node.get("text", "")
-        text = normalize_text(strip_leading_markers(raw))
+        text = strip_leading_markers(raw)
 
         if text and not is_noise(text):
             size = normalize_size(extract_max_size(node))
@@ -184,8 +171,12 @@ def build_semantic_hierarchy(dedoc_json: Dict[str, Any]) -> Dict[str, Any]:
             if b["dy"] is not None:
                 b["dy_norm"] = b["dy"] / m
 
-    # ---------- СКЛЕЙКА СТРОК ----------
+    # ---------- склейка строк ----------
     merged_blocks = merge_lines(raw_blocks)
+
+    # ---------- normalize_text ----------
+    for b in merged_blocks:
+        b["text"] = normalize_text(b["text"])
 
     # ---------- пороги ----------
     sizes = sorted(b["size"] for b in merged_blocks if b["size"] > 0)
@@ -204,8 +195,9 @@ def build_semantic_hierarchy(dedoc_json: Dict[str, Any]) -> Dict[str, Any]:
     for b in merged_blocks:
         text = b["text"]
         size = b["size"]
+        dy_norm = b["dy_norm"]
 
-        # chapter
+        # CHAPTER
         if size >= p90 and looks_like_heading(text):
             current_chapter = {
                 "chapter": text,
@@ -215,17 +207,17 @@ def build_semantic_hierarchy(dedoc_json: Dict[str, Any]) -> Dict[str, Any]:
             current_section = None
             continue
 
-        # section
-        if current_chapter and size >= p75 and looks_like_heading(text):
-            # ПРОДОЛЖЕНИЕ ЗАГОЛОВКА
-            if (
-                    current_section is not None
-                    and current_section["text"] == ""
-                    and text[:1].islower()
-            ):
-                current_section["section"] += " " + text
-                continue
-
+        # SECTION (РАБОЧАЯ ЛОГИКА)
+        if (
+            current_chapter
+            and size >= p75
+            and looks_like_heading(text)
+            and (
+                current_section is None
+                or dy_norm is None
+                or dy_norm >= 0.6
+            )
+        ):
             current_section = {
                 "section": text,
                 "text": ""
@@ -233,7 +225,7 @@ def build_semantic_hierarchy(dedoc_json: Dict[str, Any]) -> Dict[str, Any]:
             current_chapter["sections"].append(current_section)
             continue
 
-        # обычный текст
+        # TEXT
         if current_chapter:
             if current_section is None:
                 current_section = {
