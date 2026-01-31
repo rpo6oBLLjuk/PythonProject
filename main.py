@@ -17,8 +17,8 @@ TEMP_PDF = "Temp\subset.pdf"
 RAW_JSON = "Json\parsed_subset.json"
 SEMANTIC_JSON = "Json\semantic_hierarchy.json"
 
-START_PAGE = 0
-END_PAGE = 420
+START_PAGE = 4
+END_PAGE = 10
 
 
 # =========================

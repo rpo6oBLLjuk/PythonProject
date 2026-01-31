@@ -4,9 +4,12 @@ from statistics import median
 import numpy as np
 
 from toc_parser import parse_toc
+from text_utils import normalize_key, strip_leading_markers, normalize_text
+
+
 
 # ======================================================
-# УТИЛИТЫ ТЕКСТА
+# ТЕКСТОВЫЕ УТИЛИТЫ
 # ======================================================
 
 MARKER_RE = re.compile(r'^[®@Ф\\#]+\s+')
@@ -14,21 +17,6 @@ MARKER_RE = re.compile(r'^[®@Ф\\#]+\s+')
 
 def strip_leading_markers(text: str) -> str:
     return MARKER_RE.sub('', text).strip()
-
-
-def is_noise(text: str) -> bool:
-    t = text.strip()
-
-    if not t:
-        return True
-
-    if t.isdigit():
-        return True
-
-    if len(t) <= 2 and not t.isalpha():
-        return True
-
-    return False
 
 
 def normalize_text(text: str) -> str:
@@ -39,6 +27,36 @@ def normalize_text(text: str) -> str:
     text = re.sub(r'[ \t]{2,}', ' ', text)
     text = re.sub(r' *\n *', '\n', text)
     return text.strip()
+
+
+def normalize_key(text: str) -> str:
+    if not text:
+        return ""
+
+    text = strip_leading_markers(text)
+    text = re.sub(r'\.{2,}', ' ', text)
+    text = re.sub(r'\s+\d{1,4}\s*$', '', text)
+    text = normalize_text(text)
+
+    text = (
+        text.replace('«', '')
+            .replace('»', '')
+            .replace('"', '')
+            .replace("'", '')
+    )
+
+    return text.strip()
+
+
+def is_noise(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return True
+    if t.isdigit():
+        return True
+    if len(t) <= 2 and not t.isalpha():
+        return True
+    return False
 
 
 def merge_adjacent_text(block_content: List[str]) -> List[str]:
@@ -63,16 +81,13 @@ def collect_sizes_and_spacings(node: Dict[str, Any],
                                sizes: List[float],
                                spacings: List[float]):
     for ann in node.get("annotations", []):
-        if ann["name"] == "size":
-            try:
+        try:
+            if ann["name"] == "size":
                 sizes.append(float(ann["value"]))
-            except ValueError:
-                pass
-        elif ann["name"] == "spacing":
-            try:
+            elif ann["name"] == "spacing":
                 spacings.append(float(ann["value"]))
-            except ValueError:
-                pass
+        except ValueError:
+            pass
 
     for child in node.get("subparagraphs", []):
         collect_sizes_and_spacings(child, sizes, spacings)
@@ -84,7 +99,7 @@ def max_size(node: Dict[str, Any]) -> float:
         for a in node.get("annotations", [])
         if a["name"] == "size"
     ]
-    return max(vals) if vals else 0
+    return max(vals) if vals else 0.0
 
 
 def max_spacing(node: Dict[str, Any]) -> float:
@@ -93,11 +108,11 @@ def max_spacing(node: Dict[str, Any]) -> float:
         for a in node.get("annotations", [])
         if a["name"] == "spacing"
     ]
-    return max(vals) if vals else 0
+    return max(vals) if vals else 0.0
 
 
 # ======================================================
-# ПРОФИЛЬ ДОКУМЕНТА
+# ПРОФИЛЬ ШРИФТА
 # ======================================================
 
 class FontProfile:
@@ -111,14 +126,10 @@ class FontProfile:
         self.p50 = median(self.sizes)
         self.p75 = np.percentile(self.sizes, 75)
         self.p90 = np.percentile(self.sizes, 90)
-
-        self.spacing_ref = (
-            np.percentile(self.spacings, 75) if self.spacings else 40
-        )
+        self.spacing_ref = np.percentile(self.spacings, 75) if self.spacings else 40
 
     def heading_level(self, size: float, spacing: float, text: str) -> int:
         t = text.strip()
-
         if len(t) > 120:
             return -1
         if t.count('.') >= 2:
@@ -130,7 +141,6 @@ class FontProfile:
             return 1
         if size >= self.p50 * 1.1:
             return 2
-
         return -1
 
 
@@ -144,10 +154,8 @@ def build_semantic_hierarchy(dedoc_json: Dict[str, Any]) -> Dict[str, Any]:
 
     root = dedoc_json["content"]["structure"]
 
-    sizes: List[float] = []
-    spacings: List[float] = []
+    sizes, spacings = [], []
     collect_sizes_and_spacings(root, sizes, spacings)
-
     profile = FontProfile(sizes, spacings)
 
     document = {"chapters": []}
@@ -155,29 +163,23 @@ def build_semantic_hierarchy(dedoc_json: Dict[str, Any]) -> Dict[str, Any]:
     current_chapter = None
     current_part = None
     current_block = None
-    chapter_has_content = False   # <<< ДОБАВЛЕНО
+    chapter_has_content = False
 
     # ---------------- helpers ----------------
 
-    def ensure_chapter(title: str = "Без названия"):
+    def ensure_chapter(title="Без названия"):
         nonlocal current_chapter, current_part, current_block, chapter_has_content
         if current_chapter is None:
-            current_chapter = {
-                "chapter": title,
-                "content": []
-            }
+            current_chapter = {"chapter": title, "content": []}
             document["chapters"].append(current_chapter)
             current_part = None
             current_block = None
-            chapter_has_content = False   # <<<
+            chapter_has_content = False
 
     def ensure_part(name=None):
         nonlocal current_part, current_block
         if current_part is None:
-            current_part = {
-                "part": name,
-                "content": []
-            }
+            current_part = {"part": name, "content": []}
             current_chapter["content"].append(current_part)
             current_block = None
 
@@ -185,82 +187,64 @@ def build_semantic_hierarchy(dedoc_json: Dict[str, Any]) -> Dict[str, Any]:
         nonlocal current_block
         ensure_part()
         if current_block is None:
-            current_block = {
-                "block": name,
-                "content": []
-            }
+            current_block = {"block": name, "content": []}
             current_part["content"].append(current_block)
 
     # ---------------- walk ----------------
 
-    def walk(node: Dict[str, Any]):
+    def walk(node):
         nonlocal current_chapter, current_part, current_block, chapter_has_content
 
         raw = node.get("text", "")
         text = strip_leading_markers(raw)
 
-        if text:
-            if is_noise(text):
-                pass
+        if text and not is_noise(text):
+            key = normalize_key(text)
+            size = max_size(node)
+            spacing = max_spacing(node)
+
+            if key in toc_map:
+                level = toc_map[key]
+                force = True
+                print(f"[TOC MATCH] level={level} :: {text}")
             else:
-                size = max_size(node)
-                spacing = max_spacing(node)
+                level = profile.heading_level(size, spacing, text)
+                force = False
 
-                normalized = normalize_text(text)
-
-                if normalized in toc_map:
-                    print("[TOC MATCH]", repr(normalized))
-                    level = toc_map[normalized]
-                else:
-                    level = profile.heading_level(size, spacing, text)
-
-                # --------- ГЛАВА (ИСПРАВЛЕНИЕ ЗДЕСЬ) ---------
-                if level == 0:
-                    if current_chapter is None or not chapter_has_content:
-                        current_chapter = {
-                            "chapter": text,
-                            "content": []
-                        }
-                        document["chapters"].append(current_chapter)
-                        current_part = None
-                        current_block = None
-                        chapter_has_content = False
-                    else:
-                        ensure_chapter()
-                        ensure_part()
-                        current_block = {
-                            "block": text,
-                            "content": []
-                        }
-                        current_part["content"].append(current_block)
-
-                elif level == 1:
-                    ensure_chapter()
-                    current_part = {
-                        "part": text,
-                        "content": []
-                    }
-                    current_chapter["content"].append(current_part)
+            if level == 0:
+                if force or current_chapter is None or not chapter_has_content:
+                    current_chapter = {"chapter": text, "content": []}
+                    document["chapters"].append(current_chapter)
+                    current_part = None
                     current_block = None
-
-                elif level == 2:
+                    chapter_has_content = False
+                else:
                     ensure_chapter()
                     ensure_part()
-                    current_block = {
-                        "block": text,
-                        "content": []
-                    }
+                    current_block = {"block": text, "content": []}
                     current_part["content"].append(current_block)
 
-                else:
-                    ensure_chapter()
-                    ensure_part()
-                    ensure_block()
-                    current_block["content"].append(text)
-                    chapter_has_content = True   # <<< ВАЖНО
+            elif level == 1:
+                ensure_chapter()
+                current_part = {"part": text, "content": []}
+                current_chapter["content"].append(current_part)
+                current_block = None
 
-        for child in node.get("subparagraphs", []):
-            walk(child)
+            elif level == 2:
+                ensure_chapter()
+                ensure_part()
+                current_block = {"block": text, "content": []}
+                current_part["content"].append(current_block)
+
+            else:
+                ensure_chapter()
+                ensure_part()
+                ensure_block()
+                current_block["content"].append(text)
+                chapter_has_content = True
+
+        for ch in node.get("subparagraphs", []):
+            walk(ch)
 
     walk(root)
 
