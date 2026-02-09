@@ -8,187 +8,151 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QSplitter,
     QPlainTextEdit,
-    QVBoxLayout,
-    QWidget
 )
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
 
 
-class JsonStructureViewer(QMainWindow):
-    def __init__(self, json_path: str):
+# ======================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ======================================================
+
+def load_json(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def node_label(node: dict) -> str:
+    t = node.get("type")
+
+    if t in ("chapter", "section"):
+        return f"{t.upper()}: {node.get('title', '')}"
+
+    if t == "paragraph":
+        return "PARAGRAPH"
+
+    if t == "text":
+        return node.get("text", "")[:60]
+
+    if t == "list":
+        return "LIST"
+
+    if t == "qa":
+        return f"Q&A: {node.get('title', '')}"
+
+    return t or "NODE"
+
+
+def node_content(node: dict) -> str:
+    t = node.get("type")
+
+    if t == "text":
+        return node.get("text", "")
+
+    if t == "list":
+        return "\n".join(f"- {x}" for x in node.get("items", []))
+
+    if t == "qa":
+        lines = []
+        for item in node.get("items", []):
+            q = item.get("question", "")
+            a = item.get("answer")
+            lines.append(f"Q: {q}")
+            if a:
+                lines.append(f"A: {a}")
+            lines.append("")
+        return "\n".join(lines)
+
+    return ""
+
+
+# ======================================================
+# ОСНОВНОЙ VIEWER
+# ======================================================
+
+class DocumentViewer(QMainWindow):
+    def __init__(self):
         super().__init__()
+        self.setWindowTitle("Document Viewer")
+        self.resize(1200, 800)
 
-        self.setWindowTitle("Document Structure Viewer")
-        self.resize(1000, 700)
-
-        # Создаем главный виджет
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        layout = QVBoxLayout(main_widget)
-        layout.setContentsMargins(0, 0, 0, 0)  # Убираем отступы
-
-        # Создаем сплиттер для дерева и текста
-        splitter = QSplitter(Qt.Horizontal)
-        layout.addWidget(splitter)
-
-        # Левая панель с деревом
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Структура документа"])
-        self.tree.setColumnWidth(0, 350)
+        self.tree.setHeaderHidden(True)
+
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+
+        splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self.tree)
+        splitter.addWidget(self.text)
+        splitter.setSizes([400, 800])
 
-        # Правая панель с текстом
-        text_container = QWidget()
-        text_layout = QVBoxLayout(text_container)
-        text_layout.setContentsMargins(0, 0, 0, 0)
+        self.setCentralWidget(splitter)
 
-        self.text_view = QPlainTextEdit()
-        self.text_view.setReadOnly(True)
-        self.text_view.setFont(QFont("Consolas", 10))
-        text_layout.addWidget(self.text_view)
+        self.tree.itemClicked.connect(self.on_item_clicked)
 
-        splitter.addWidget(text_container)
+        self.node_by_item = {}
 
-        splitter.setSizes([350, 650])
+        self.open_file()
 
-        # Подключаем сигнал двойного клика
-        self.tree.itemDoubleClicked.connect(self.on_item_double_clicked)
+    # --------------------------------------------------
 
-        self.load_json(json_path)
-
-    def load_json(self, path: str):
-        """Загружает и отображает JSON структуру документа"""
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            self.show_error(f"Ошибка загрузки JSON: {str(e)}")
+    def open_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open JSON",
+            "",
+            "JSON files (*.json)"
+        )
+        if not path:
             return
 
+        data = load_json(path)
         self.tree.clear()
+        self.node_by_item.clear()
 
-        chapters = data.get("chapters", [])
+        root_item = QTreeWidgetItem([node_label(data)])
+        self.tree.addTopLevelItem(root_item)
+        self.node_by_item[root_item] = data
 
-        if not chapters:
-            no_data_item = QTreeWidgetItem(["Документ не содержит глав"])
-            self.tree.addTopLevelItem(no_data_item)
-            return
+        self.build_tree(root_item, data)
 
-        for chapter_idx, chapter in enumerate(chapters, 1):
-            chapter_title = chapter.get("chapter", f"Глава {chapter_idx}")
-
-            # Создаем элемент главы
-            chapter_item = QTreeWidgetItem([
-                f"Глава {chapter_idx}: {chapter_title}"
-            ])
-            chapter_item.setData(0, Qt.UserRole, {
-                "type": "chapter",
-                "title": chapter_title,
-                "full_text": None
-            })
-            self.tree.addTopLevelItem(chapter_item)
-
-            # Добавляем разделы
-            sections = chapter.get("sections", [])
-
-            if not sections:
-                no_sections_item = QTreeWidgetItem(["  [Нет разделов]"])
-                chapter_item.addChild(no_sections_item)
-                continue
-
-            for section_idx, section in enumerate(sections, 1):
-                section_title = section.get("section")
-
-                # Формируем отображаемое название раздела
-                if section_title:
-                    display_title = f"Раздел {section_idx}: {section_title}"
-                else:
-                    display_title = f"Раздел {section_idx}: [Без названия]"
-
-                # Создаем элемент раздела
-                section_item = QTreeWidgetItem([display_title])
-                section_item.setData(0, Qt.UserRole, {
-                    "type": "section",
-                    "title": section_title,
-                    "full_text": section.get("text", "")
-                })
-                chapter_item.addChild(section_item)
-
-        # Разворачиваем все элементы
         self.tree.expandAll()
 
-    def on_item_double_clicked(self, item: QTreeWidgetItem):
-        """Обрабатывает двойной клик по элементу дерева"""
-        data = item.data(0, Qt.UserRole)
+    # --------------------------------------------------
 
-        if not data:
-            self.text_view.clear()
+    def build_tree(self, parent_item: QTreeWidgetItem, node: dict):
+        # children для chapter / section / paragraph
+        for child in node.get("children", []):
+            item = QTreeWidgetItem([node_label(child)])
+            parent_item.addChild(item)
+            self.node_by_item[item] = child
+            self.build_tree(item, child)
+
+        # blocks для paragraph
+        for block in node.get("blocks", []):
+            item = QTreeWidgetItem([node_label(block)])
+            parent_item.addChild(item)
+            self.node_by_item[item] = block
+
+    # --------------------------------------------------
+
+    def on_item_clicked(self, item: QTreeWidgetItem, _column: int):
+        node = self.node_by_item.get(item)
+        if not node:
             return
 
-        if data["type"] == "section":
-            # Для раздела показываем текст
-            text = data.get("full_text", "")
+        content = node_content(node)
+        self.text.setPlainText(content)
 
-            # Добавляем заголовок к тексту
-            title = data.get("title")
-            if title:
-                header = f"РАЗДЕЛ: {title}\n{'=' * 60}\n\n"
-            else:
-                header = "РАЗДЕЛ: [Без названия]\n{'='*60}\n\n"
 
-            self.text_view.setPlainText(header + text)
-        elif data["type"] == "chapter":
-            # Для главы собираем все тексты разделов
-            chapter_text = []
-
-            # Проходим по всем дочерним элементам (разделам)
-            for i in range(item.childCount()):
-                child = item.child(i)
-                child_data = child.data(0, Qt.UserRole)
-                if child_data and child_data["type"] == "section":
-                    title = child_data.get("title", "[Без названия]")
-                    text = child_data.get("full_text", "")
-
-                    chapter_text.append(f"РАЗДЕЛ: {title}")
-                    chapter_text.append("=" * 50)
-                    chapter_text.append(text)
-                    chapter_text.append("\n" + "-" * 70 + "\n")
-
-            if chapter_text:
-                header = f"ГЛАВА: {data.get('title', '')}\n{'=' * 60}\n\n"
-                self.text_view.setPlainText(header + "\n".join(chapter_text))
-            else:
-                self.text_view.setPlainText(f"ГЛАВА: {data.get('title', '')}\n\n[Нет текста в разделах]")
-
-    def show_error(self, message: str):
-        """Показывает сообщение об ошибке"""
-        error_item = QTreeWidgetItem([f"Ошибка: {message}"])
-        self.tree.addTopLevelItem(error_item)
-
+# ======================================================
+# ENTRY POINT
+# ======================================================
 
 def main():
     app = QApplication(sys.argv)
-
-    # Если путь передан как аргумент командной строки
-    if len(sys.argv) > 1:
-        json_path = sys.argv[1]
-    else:
-        # Иначе открываем диалог выбора файла
-        json_path, _ = QFileDialog.getOpenFileName(
-            None,
-            "Выберите JSON файл с семантической структурой",
-            "",
-            "JSON файлы (*.json);;Все файлы (*)"
-        )
-
-    if not json_path:
-        print("Файл не выбран. Выход.")
-        sys.exit(0)
-
-    viewer = JsonStructureViewer(json_path)
+    viewer = DocumentViewer()
     viewer.show()
-
     sys.exit(app.exec())
 
 

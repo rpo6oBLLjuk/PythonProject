@@ -1,6 +1,7 @@
 from typing import Dict, Any, List, Optional
 from statistics import median
 import json
+import re
 
 from text_utils import strip_leading_markers, normalize_text
 
@@ -36,19 +37,25 @@ def extract_spacing(node: Dict[str, Any]) -> float:
     return 0.0
 
 
-def extract_y_px(node: Dict[str, Any]) -> Optional[float]:
+def extract_bbox(node: Dict[str, Any]) -> Optional[Dict[str, float]]:
     for ann in node.get("annotations", []):
         if ann.get("name") == "bounding box":
             try:
                 val = ann.get("value")
-                bb = json.loads(val) if isinstance(val, str) else val
-                y = bb.get("y_top_left")
-                h = bb.get("page_height")
-                if y is not None and h:
-                    return float(y) * float(h)
+                return json.loads(val) if isinstance(val, str) else val
             except Exception:
                 pass
     return None
+
+
+def extract_y_px(node: Dict[str, Any]) -> Optional[float]:
+    bb = extract_bbox(node)
+    if not bb:
+        return None
+    try:
+        return float(bb["y_top_left"]) * float(bb["page_height"])
+    except Exception:
+        return None
 
 
 def extract_page(node: Dict[str, Any]) -> Optional[int]:
@@ -100,7 +107,6 @@ def merge_lines(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         )
 
         if same_size and close_vertically:
-            # перенос с дефисом
             if last["text"].endswith("-"):
                 last["text"] = last["text"][:-1] + b["text"]
             else:
@@ -110,6 +116,46 @@ def merge_lines(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         merged.append(b)
 
     return merged
+
+
+# ======================================================
+# ПОСТ-ОБРАБОТКА СПИСКОВ
+# ======================================================
+
+LIST_ITEM_RE = re.compile(r'^\s*\d+[.)]')
+INLINE_LIST_RE = re.compile(r'([^\n])\s+(\d+[.)]\s+)')
+
+
+def fix_lists(text: str) -> str:
+    """
+    1. Склеивает продолжения пунктов списка
+    2. Восстанавливает разрывы между пунктами
+    """
+    if not text:
+        return text
+
+    # --- восстановление разрывов между пунктами ---
+    text = re.sub(r'([^\n])\s+(\d+[.)]\s+)', r'\1\n\n\2', text)
+
+    parts = text.split("\n\n")
+    fixed: List[str] = []
+
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+
+        if (
+            fixed
+            and not LIST_ITEM_RE.match(p)
+            and LIST_ITEM_RE.match(fixed[-1])
+            and p[0].islower()
+        ):
+            fixed[-1] += " " + p
+        else:
+            fixed.append(p)
+
+    return "\n\n".join(fixed)
 
 
 # ======================================================
@@ -207,7 +253,7 @@ def build_semantic_hierarchy(dedoc_json: Dict[str, Any]) -> Dict[str, Any]:
             current_section = None
             continue
 
-        # SECTION (РАБОЧАЯ ЛОГИКА)
+        # SECTION
         if (
             current_chapter
             and size >= p75
@@ -238,5 +284,10 @@ def build_semantic_hierarchy(dedoc_json: Dict[str, Any]) -> Dict[str, Any]:
                 current_section["text"] += "\n\n" + text
             else:
                 current_section["text"] = text
+
+    # ---------- пост-обработка списков ----------
+    for ch in document["chapters"]:
+        for sec in ch["sections"]:
+            sec["text"] = fix_lists(sec["text"])
 
     return document
