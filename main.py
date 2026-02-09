@@ -6,9 +6,6 @@ from pypdf import PdfReader, PdfWriter
 from dedoc import DedocManager
 
 from text_utils import normalize_text
-from chunker import TextChunker
-from ollama_client import OllamaClient
-from validator import JSONStructureValidator
 
 
 # =========================
@@ -21,9 +18,6 @@ TEMP_PDF = r"Temp\subset.pdf"
 
 RAW_JSON = r"Json\parsed_subset.json"
 PLAIN_TEXT_JSON = r"Json\plain_text_for_llm.json"
-STRUCTURED_JSON = r"Json\structured_result.json"
-
-SCHEMA_PATH = r"schema.json"
 
 START_PAGE = 4
 END_PAGE = 10
@@ -39,6 +33,10 @@ def extract_pages(
     start_page: int,
     end_page: int
 ) -> bool:
+    """
+    Извлекает страницы [start_page, end_page] (1-индексация),
+    автоматически зажимая диапазон в пределах документа.
+    """
     reader = PdfReader(input_pdf)
     writer = PdfWriter()
 
@@ -73,8 +71,13 @@ def extract_pages(
 # =========================
 
 def parse_pdf_with_dedoc(pdf_path: str) -> Dict[str, Any]:
+    """
+    Парсит PDF через dedoc и возвращает JSON-словарь.
+    """
     manager = DedocManager()
-    params = {"language": "rus"}
+    params = {
+        "language": "rus"
+    }
     result = manager.parse(file_path=pdf_path, parameters=params)
     return result.to_api_schema().model_dump()
 
@@ -87,10 +90,19 @@ def save_json(data: Any, path: str) -> None:
 
 
 # =========================
-# DEDOC → ПЛОСКИЙ ТЕКСТ
+# DEDOC → ПЛОСКИЙ ТЕКСТ ДЛЯ LLM
 # =========================
 
 def extract_plain_text(dedoc_json: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Превращает dedoc-структуру в линейный список страниц с текстом.
+    Формат — идеальный вход для LLM.
+
+    [
+      { "page": 4, "text": "..." },
+      { "page": 5, "text": "..." }
+    ]
+    """
     blocks: List[Dict[str, Any]] = []
 
     def walk(node: Dict[str, Any]):
@@ -115,99 +127,34 @@ def extract_plain_text(dedoc_json: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 # =========================
-# PLAIN TEXT → LLM → JSON
-# =========================
-
-def blocks_to_text(blocks: List[Dict[str, Any]]) -> str:
-    return "\n\n".join(b["text"] for b in blocks)
-
-
-def build_prompt(text: str) -> str:
-    return f"""
-Ты преобразуешь учебный текст в строгий JSON.
-
-Правила:
-- НЕ сокращай текст
-- НЕ перефразируй
-- НЕ добавляй ничего от себя
-- сохраняй порядок текста
-- каждый логический фрагмент — block
-- списки → block(kind="list")
-- вопросы и задания → block(kind="questions")
-
-Структура:
-chapter → paragraph → section → block
-
-Верни ТОЛЬКО JSON.
-
-Текст:
-{text}
-""".strip()
-
-
-# =========================
 # ОСНОВНОЙ ПАЙПЛАЙН
 # =========================
 
 def run_pipeline() -> None:
+    # 1. Вырезаем страницы
     ok = extract_pages(
-        INPUT_PDF,
-        TEMP_PDF,
-        START_PAGE,
-        END_PAGE
+        input_pdf=INPUT_PDF,
+        output_pdf=TEMP_PDF,
+        start_page=START_PAGE,
+        end_page=END_PAGE
     )
+
     if not ok:
         return
 
     try:
-        # 1. dedoc
+        # 2. Парсим через dedoc
         raw_json = parse_pdf_with_dedoc(TEMP_PDF)
         save_json(raw_json, RAW_JSON)
 
-        # 2. plain text
-        plain_blocks = extract_plain_text(raw_json)
-        save_json(plain_blocks, PLAIN_TEXT_JSON)
+        # 3. Готовим текст для LLM
+        plain_text = extract_plain_text(raw_json)
+        save_json(plain_text, PLAIN_TEXT_JSON)
 
-        # 3. чанкинг
-        chunker = TextChunker(max_chars=4500, soft_limit=3500)
-        chunks = chunker.chunk(plain_blocks)
-
-        print(f"[OK] Получено чанков: {len(chunks)}")
-
-        # 4. LLM + валидация
-        llm = OllamaClient()
-        validator = JSONStructureValidator(SCHEMA_PATH)
-
-        structured_results = []
-
-        for idx, chunk in enumerate(chunks, start=1):
-            print(f"[LLM] Чанк {idx}/{len(chunks)}")
-
-            text = blocks_to_text(chunk)
-            prompt = build_prompt(text)
-
-            response = llm.generate(prompt)
-
-            try:
-                parsed = json.loads(response)
-            except json.JSONDecodeError as e:
-                raise RuntimeError(
-                    f"❌ Некорректный JSON от LLM (чанк {idx})"
-                ) from e
-
-            errors = validator.validate(parsed)
-            if errors:
-                print("❌ Ошибки валидации:")
-                for err in errors:
-                    print(" -", err)
-                raise RuntimeError(f"JSON не прошёл валидацию (чанк {idx})")
-
-            structured_results.append(parsed)
-
-        save_json(structured_results, STRUCTURED_JSON)
-        print("[OK] Структурированный JSON готов")
+        print("[OK] Текст подготовлен для передачи в LLM")
 
     finally:
+        # 4. Удаляем временный PDF
         if os.path.exists(TEMP_PDF):
             os.remove(TEMP_PDF)
             print(f"[OK] Временный файл удалён: {TEMP_PDF}")
