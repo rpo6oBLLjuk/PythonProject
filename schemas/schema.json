@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["type", "children"],
+  "properties": {
+    "type": { "const": "document" },
+    "children": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/chapter" }
+    }
+  },
+  "definitions": {
+    "chapter": {
+      "type": "object",
+      "required": ["type", "title", "children"],
+      "properties": {
+        "type": { "const": "chapter" },
+        "title": { "type": ["string", "null"] },
+        "children": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/paragraph" }
+        }
+      }
+    },
+    "paragraph": {
+      "type": "object",
+      "required": ["type", "title", "children"],
+      "properties": {
+        "type": { "const": "paragraph" },
+        "title": { "type": ["string", "null"] },
+        "children": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/section" }
+        }
+      }
+    },
+    "section": {
+      "type": "object",
+      "required": ["type", "section_type", "text"],
+      "properties": {
+        "type": { "const": "section" },
+        "title": { "type": ["string", "null"] },
+        "section_type": {
+          "type": "string",
+          "enum": [
+            "text",
+            "task",
+            "exercise",
+            "rule",
+            "definition",
+            "example",
+            "dialogue",
+            "list",
+            "note"
+          ]
+        }
+        ,
+        "text": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,168 +1,461 @@
 import os
 import json
-from typing import List, Dict, Any
+import datetime
 
 from pypdf import PdfReader, PdfWriter
 from dedoc import DedocManager
 
-from text_utils import normalize_text
+from chunker import TextChunker
+from gemini_client import GeminiClient
+from ollama_client import OllamaClient
+from openai_client import OpenAIClient
+from safe_json_loads import safe_json_loads
+from validator import JsonValidator
 
 
-# =========================
-# КОНФИГУРАЦИЯ
-# =========================
+# =========================================================
+# PIPELINE FLAGS
+# =========================================================
 
-INPUT_PDF = r"C:\Users\Admin\Documents\PDF_import\5a213f4f24_literatura-9-klass-1-chast.pdf"
+PIPELINE = {
+    "extract_pdf": False,
+    "dedoc_parse": False,
+    "extract_plain_text": False,
+    "llm_structure": True,
+    "validate_schema": True,
+    "clean_text": False,
+}
 
-TEMP_PDF = r"Temp\subset.pdf"
 
-RAW_JSON = r"Json\parsed_subset.json"
-PLAIN_TEXT_JSON = r"Json\plain_text_for_llm.json"
+# =========================================================
+# LLM CLIENT
+# =========================================================
 
-START_PAGE = 4
-END_PAGE = 10
+structure_llm = GeminiClient()
+cleaner_llm = OllamaClient()
+
+# =========================================================
+# PATHS
+# =========================================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+INPUT_PDF = r"C:\Users\Admin\Downloads\1726658755_ladyzhenskaia_t__russki_iazyk_5_klass_4.pdf"
+
+TEMP_PDF = os.path.join(BASE_DIR, "Temp", "subset.pdf")
+
+RAW_DEDOC_JSON = os.path.join(BASE_DIR, "Json", "parsed_subset.json")
+PLAIN_JSON = os.path.join(BASE_DIR, "Json", "plain_text_for_llm.json")
+RAW_LLM_JSON = os.path.join(BASE_DIR, "Json", "raw_llm_output.json")
+STRUCTURED_JSON = os.path.join(BASE_DIR, "Json", "final_chapter.json")
+CLEAN_JSON = os.path.join(BASE_DIR, "Json", "final_chapter_clean.json")
+
+SCHEMA_PATH = os.path.join(BASE_DIR, "schemas", "schema.json")
 
 
-# =========================
-# PDF → SUBSET
-# =========================
+# =========================================================
+# SYSTEM PROMPT
+# =========================================================
 
-def extract_pages(
-    input_pdf: str,
-    output_pdf: str,
-    start_page: int,
-    end_page: int
-) -> bool:
-    """
-    Извлекает страницы [start_page, end_page] (1-индексация),
-    автоматически зажимая диапазон в пределах документа.
-    """
-    reader = PdfReader(input_pdf)
+SYSTEM_PROMPT = """
+Ты — система логической структуризации учебного или методического текста.
+
+Тебе передаётся большой фрагмент документа.
+Это может быть часть книги, учебника, методички или конспекта.
+
+Твоя задача — автоматически восстановить логическую структуру документа
+и вернуть РОВНО ОДИН JSON-объект.
+
+СТРОГАЯ JSON-СТРУКТУРА
+
+{
+    "type": "chapter",
+    "title": string | null,
+    "children": [
+        {
+        "type": "paragraph",
+        "title": string | null,
+        "children": [
+            {
+            "type": "section",
+            "title": string | null,
+            "section_type": "text | exercise | task | rule | definition | list | example | note",
+            "text": string | null
+            }
+          ]
+        }
+      ]
+},
+{
+    "type": "chapter",
+    "title": string | null,
+    "children": [
+        {
+        "type": "paragraph",
+        "title": string | null,
+        "children": [
+            {
+            "type": "section",
+            "title": string | null,
+            "section_type": "text | exercise | task | rule | definition | list | example | note",
+            "text": string | null
+            }
+          ]
+        }
+      ]
+}
+
+ОБЩИЕ ПРАВИЛА
+
+Никаких комментариев.
+
+Никакого markdown.
+
+Никаких пояснений.
+
+Только валидный JSON.
+
+Ответ должен начинаться с "{" и заканчиваться "}".
+
+НЕ ПРИДУМЫВАЙ И НЕ ДОПИСЫВАЙ ТЕКСТ.
+
+ЗАПРЕЩЕНО ПЕРЕФОРМУЛИРОВАТЬ ЗАГОЛОВКИ.
+
+ЛОГИКА УРОВНЕЙ
+
+CHAPTER
+— Самый верхний визуальный заголовок.
+— Берётся ДОСЛОВНО из текста.
+— Если явного заголовка нет → null.
+
+PARAGRAPH
+— Подраздел главы.
+— Берётся ДОСЛОВНО из текста.
+— Если подзаголовка нет → null.
+
+SECTION
+— Минимальная логическая единица внутри paragraph.
+— Каждый смысловой блок оформляется как section.
+
+СТРОГОЕ ПРАВИЛО TITLE
+
+"title" может быть ТОЛЬКО:
+
+дословной строкой из входного текста
+
+полностью совпадающей с исходным фрагментом
+
+Запрещено:
+
+сокращать
+
+обобщать
+
+улучшать формулировку
+
+давать смысловое название
+
+придумывать краткий заголовок
+
+интерпретировать содержание
+
+Если отдельного заголовка в тексте нет →
+"title": null
+
+Номер задания (например "2.") не превращается в новый заголовок.
+Он включается в title только если стоит как самостоятельная строка.
+
+РАЗГРАНИЧЕНИЕ title И text
+
+Если встречается:
+
+Задание с номером
+
+Если строка содержит формулировку задания
+(например: "2. Прочитайте текст и определите его тему.")
+
+→ Вся эта строка целиком идёт в "title".
+→ Всё, что следует после неё и относится к этому заданию, идёт в "text".
+
+Если задание не имеет дополнительного текста
+→ "text": null
+
+Список
+
+Если перед списком есть заголовок
+→ он идёт в "title".
+→ элементы списка — в "text".
+→ элементы разделяются переносами строки "\n".
+
+Если список без заголовка
+→ "title": null
+→ элементы списка — в "text".
+
+Определение
+
+Если есть строка вида:
+"Транскрипция — это ..."
+
+→ термин до тире — в "title".
+→ текст после тире — в "text".
+
+Правило
+
+Если есть явный заголовок правила
+→ он идёт в "title".
+→ формулировка правила — в "text".
+
+Если заголовка нет
+→ "title": null
+→ правило целиком в "text".
+
+Обычный текст
+
+Если перед текстом нет отдельного заголовка
+→ "title": null
+→ весь текст в "text".
+
+Запрещено создавать смысловые заголовки вроде:
+"Назначение языка"
+"Введение"
+"Информационный блок"
+
+Если такого текста нет во входе — такого title быть не должно.
+
+ОПРЕДЕЛЕНИЕ section_type
+
+Используй только:
+
+text
+exercise
+task
+rule
+definition
+list
+example
+note
+
+Если тип невозможно определить — используй "text".
+
+СТРУКТУРНЫЕ ПРАВИЛА
+
+Не дроби текст на отдельные предложения.
+
+Объединяй логически связанный текст в один section.
+
+Разделяй section только если меняется тип содержимого.
+
+Внутри text допускаются абзацы через "\n\n".
+
+Не сокращай текст.
+
+Не перефразируй текст.
+
+Не добавляй ничего от себя.
+
+ОПРЕДЕЛЕНИЕ УРОВНЯ CHAPTER
+
+Если строка:
+
+написана полностью ЗАГЛАВНЫМИ буквами
+
+не содержит номера параграфа (§)
+
+визуально выделена как крупный заголовок
+
+не является частью задания
+
+ТО ЭТО ОБЯЗАТЕЛЬНО "type": "chapter".
+
+Такая строка не может быть paragraph.
+
+Если во входном фрагменте встречается новый заголовок уровня chapter —
+нужно закрыть предыдущую главу и начать новую.
+
+ЗАПРЕЩЕНО
+
+❌ создавать несколько chapter
+❌ создавать document
+❌ использовать другие поля
+❌ добавлять новые типы section_type
+❌ возвращать несколько JSON подряд
+❌ придумывать заголовки
+
+Верни ТОЛЬКО один валидный JSON.
+""".strip()
+
+
+
+
+# =========================================================
+# PDF HELPERS
+# =========================================================
+
+def extract_pages(start: int, end: int):
+    reader = PdfReader(INPUT_PDF)
     writer = PdfWriter()
 
-    total_pages = len(reader.pages)
+    for i in range(start - 1, end):
+        writer.add_page(reader.pages[i])
 
-    start = max(1, start_page)
-    end = min(end_page, total_pages)
+    os.makedirs(os.path.dirname(TEMP_PDF), exist_ok=True)
 
-    if start > end:
-        print(
-            f"[WARN] Диапазон пуст: start={start_page}, "
-            f"end={end_page}, pages={total_pages}"
-        )
-        return False
-
-    for page_num in range(start - 1, end):
-        writer.add_page(reader.pages[page_num])
-
-    os.makedirs(os.path.dirname(output_pdf), exist_ok=True)
-    with open(output_pdf, "wb") as f:
+    with open(TEMP_PDF, "wb") as f:
         writer.write(f)
 
-    print(
-        f"[OK] Извлечены страницы {start}–{end} "
-        f"(из {total_pages}) → {output_pdf}"
-    )
-    return True
 
-
-# =========================
-# SUBSET → DEDOC JSON
-# =========================
-
-def parse_pdf_with_dedoc(pdf_path: str) -> Dict[str, Any]:
-    """
-    Парсит PDF через dedoc и возвращает JSON-словарь.
-    """
+def parse_pdf():
     manager = DedocManager()
     params = {
-        "language": "rus"
+        "language": "rus",
+        "pdf_with_text_layer": "true",
+        "need_pdf_table_analysis": "false",
+        "need_header_footer_analysis": "false"
     }
-    result = manager.parse(file_path=pdf_path, parameters=params)
+
+    result = manager.parse(file_path=TEMP_PDF, parameters=params)
     return result.to_api_schema().model_dump()
 
 
-def save_json(data: Any, path: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    print(f"[OK] JSON сохранён: {path}")
+def extract_plain_blocks(dedoc_json):
+    blocks = []
 
-
-# =========================
-# DEDOC → ПЛОСКИЙ ТЕКСТ ДЛЯ LLM
-# =========================
-
-def extract_plain_text(dedoc_json: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Превращает dedoc-структуру в линейный список страниц с текстом.
-    Формат — идеальный вход для LLM.
-
-    [
-      { "page": 4, "text": "..." },
-      { "page": 5, "text": "..." }
-    ]
-    """
-    blocks: List[Dict[str, Any]] = []
-
-    def walk(node: Dict[str, Any]):
-        raw_text = node.get("text", "")
-        page = node.get("metadata", {}).get("page_id")
-
-        if raw_text:
-            text = normalize_text(raw_text)
-            if text:
-                blocks.append({
-                    "page": page,
-                    "text": text
-                })
-
+    def walk(node):
+        text = node.get("text")
+        if text:
+            blocks.append({"text": text})
         for ch in node.get("subparagraphs", []):
             walk(ch)
 
-    root = dedoc_json["content"]["structure"]
-    walk(root)
-
+    walk(dedoc_json["content"]["structure"])
     return blocks
 
 
-# =========================
-# ОСНОВНОЙ ПАЙПЛАЙН
-# =========================
+# =========================================================
+# MAIN PIPELINE
+# =========================================================
 
-def run_pipeline() -> None:
-    # 1. Вырезаем страницы
-    ok = extract_pages(
-        input_pdf=INPUT_PDF,
-        output_pdf=TEMP_PDF,
-        start_page=START_PAGE,
-        end_page=END_PAGE
-    )
+def run_pipeline():
 
-    if not ok:
-        return
+    # ===============================
+    # STEP 1 — PDF
+    # ===============================
 
-    try:
-        # 2. Парсим через dedoc
-        raw_json = parse_pdf_with_dedoc(TEMP_PDF)
-        save_json(raw_json, RAW_JSON)
-
-        # 3. Готовим текст для LLM
-        plain_text = extract_plain_text(raw_json)
-        save_json(plain_text, PLAIN_TEXT_JSON)
-
-        print("[OK] Текст подготовлен для передачи в LLM")
-
-    finally:
-        # 4. Удаляем временный PDF
-        if os.path.exists(TEMP_PDF):
-            os.remove(TEMP_PDF)
-            print(f"[OK] Временный файл удалён: {TEMP_PDF}")
+    if PIPELINE["extract_pdf"]:
+        print(datetime.datetime.now(), "[INFO] Extract PDF Start")
+        extract_pages(4, 100)
+        print(datetime.datetime.now(), "[INFO] Extract PDF Completed")
 
 
-# =========================
-# ENTRY POINT
-# =========================
+    if PIPELINE["dedoc_parse"]:
+        print(datetime.datetime.now(), "[INFO] Dedoc parse start")
+        dedoc_json = parse_pdf()
+        os.remove(TEMP_PDF)
+
+        with open(RAW_DEDOC_JSON, "w", encoding="utf-8") as f:
+            json.dump(dedoc_json, f, ensure_ascii=False, indent=2)
+    else:
+        with open(RAW_DEDOC_JSON, "r", encoding="utf-8") as f:
+            dedoc_json = json.load(f)
+
+    print(datetime.datetime.now(), "[OK] Dedoc parse Completed")
+
+    # ===============================
+    # STEP 2 — Plain Text
+    # ===============================
+    if PIPELINE["extract_plain_text"]:
+        print(datetime.datetime.now(), "[INFO] Plain Text Start")
+        plain_blocks = extract_plain_blocks(dedoc_json)
+        with open(PLAIN_JSON, "w", encoding="utf-8") as f:
+            json.dump(plain_blocks, f, ensure_ascii=False, indent=2)
+    else:
+        with open(PLAIN_JSON, "r", encoding="utf-8") as f:
+            plain_blocks = json.load(f)
+
+    print(datetime.datetime.now(), "[OK] Plain Text Completed")
+    # ===============================
+    # STEP 3 — Chunking
+    # ===============================
+    print(datetime.datetime.now(), "[INFO] Chunker Start")
+    chunker = TextChunker(max_chars=80000)
+    chunks = chunker.chunk(plain_blocks)
+    print(datetime.datetime.now(), "[OK] Chunker Completed")
+    # ===============================
+    # STEP 4 — LLM STRUCTURE
+    # ===============================
+    document = {
+        "type": "document",
+        "children": []
+    }
+
+    raw_llm_responses = []
+
+    if PIPELINE["llm_structure"]:
+
+        print(datetime.datetime.now(),"[INFO] LLM structure generate Start")
+
+        for i, chunk in enumerate(chunks, 1):
+
+            response = structure_llm.generate(
+                system_prompt=SYSTEM_PROMPT,
+                user_text=chunk["text"]
+            )
+
+            raw_llm_responses.append(response)
+
+            chapters = safe_json_loads(response)
+
+            for ch in chapters:
+                document["children"].append(ch)
+
+        # 1️⃣ сохраняем RAW
+        with open(RAW_LLM_JSON, "w", encoding="utf-8") as f:
+            json.dump(raw_llm_responses, f, ensure_ascii=False, indent=2)
+
+        # 2️⃣ сохраняем STRUCTURED
+        with open(STRUCTURED_JSON, "w", encoding="utf-8") as f:
+            json.dump(document, f, ensure_ascii=False, indent=2)
+
+    else:
+        with open(STRUCTURED_JSON, "r", encoding="utf-8") as f:
+            document = json.load(f)
+
+    print(datetime.datetime.now(), "[OK] LLM structure generate Completed")
+    # ===============================
+    # STEP 5 — VALIDATE
+    # ===============================
+    print(datetime.datetime.now(), "[INFO] Validator Start")
+    if PIPELINE["validate_schema"]:
+        validator = JsonValidator(SCHEMA_PATH)
+        errors = validator.validate(document)
+
+        if errors:
+            raise RuntimeError(errors)
+    print(datetime.datetime.now(), "[OK] Validator Completed")
+    # ===============================
+    # SAVE STRUCTURE
+    # ===============================
+    with open(STRUCTURED_JSON, "w", encoding="utf-8") as f:
+        json.dump(document, f, ensure_ascii=False, indent=2)
+
+    print("[OK] Structure saved")
+
+    # ===============================
+    # STEP 6 — CLEAN TEXT
+    # ===============================
+
+    if PIPELINE["clean_text"]:
+        print(datetime.datetime.now(), "[INFO] Text clean Start")
+        from text_cleaner import TextCleaner
+
+        cleaner = TextCleaner(cleaner_llm)
+        document = cleaner.clean_document(document)
+
+        with open(CLEAN_JSON, "w", encoding="utf-8") as f:
+            json.dump(document, f, ensure_ascii=False, indent=2)
+
+        print("[OK] Text clean Complete")
+
 
 if __name__ == "__main__":
     run_pipeline()

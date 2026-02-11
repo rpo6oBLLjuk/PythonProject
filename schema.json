@@ -1,82 +1,13 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "required": ["type", "title", "children"],
   "properties": {
-    "type": {
-      "const": "chapter"
-    },
-    "title": {
-      "type": "string"
-    },
+    "type": { "const": "chapter" },
+    "title": { "type": "string" },
     "children": {
       "type": "array",
-      "items": { "$ref": "#/$defs/paragraph" }
+      "items": { "$ref": "paragraph.schema.json" }
     }
   },
-
-  "$defs": {
-    "paragraph": {
-      "type": "object",
-      "required": ["type", "title", "children"],
-      "properties": {
-        "type": { "const": "paragraph" },
-        "title": { "type": ["string", "null"] },
-        "children": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/section" }
-        }
-      },
-      "additionalProperties": false
-    },
-
-    "section": {
-      "type": "object",
-      "required": ["type", "children"],
-      "properties": {
-        "type": { "const": "section" },
-        "children": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/block" }
-        }
-      },
-      "additionalProperties": false
-    },
-
-    "block": {
-      "type": "object",
-      "required": ["type", "kind", "title", "content"],
-      "properties": {
-        "type": { "const": "block" },
-        "kind": {
-          "enum": ["text", "list", "definition", "questions"]
-        },
-        "title": {
-          "type": ["string", "null"]
-        },
-        "content": {
-          "oneOf": [
-            { "type": "string" },
-            {
-              "type": "object",
-              "required": ["ordered", "items"],
-              "properties": {
-                "ordered": { "const": false },
-                "items": {
-                  "type": "array",
-                  "items": { "type": "string" }
-                }
-              },
-              "additionalProperties": false
-            },
-            {
-              "type": "array",
-              "items": { "type": "string" }
-            }
-          ]
-        }
-      },
-      "additionalProperties": false
-    }
-  }
+  "additionalProperties": false
 }
